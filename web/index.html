@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Puzzle Solver</title>
+    <script type="text/javascript" src="/eel.js"></script>
+    <link rel="stylesheet" href="tyle.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <div class="header">
+            <h1>🧩 Puzzle Solver</h1>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progress" style="width: 0%"></div>
+            </div>
+            <div class="stats">
+                <span>Placed: <strong id="stat-placed">0</strong></span>
+                <span>Remaining: <strong id="stat-remaining">0</strong></span>
+                <span>Total: <strong id="stat-total">0</strong></span>
+            </div>
+        </div>
+        
+        <!-- Load panel (shown initially) -->
+        <div class="load-panel" id="loadPanel">
+            <h2>Load Puzzle Pieces</h2>
+            <div class="drop-zone" id="dropZone">
+                <p style="font-size: 18px; margin-bottom: 10px;">📂 Drop images here</p>
+                <p style="color: #666;">or click to browse</p>
+                <input type="file" id="fileInput" multiple accept="image/*" style="display: none;">
+            </div>
+            <button class="btn-load" onclick="document.getElementById('fileInput').click()">
+                Browse Files
+            </button>
+        </div>
+        
+        <!-- Main content (hidden initially) -->
+        <div class="main-content hidden" id="mainContent">
+            <!-- Reference piece -->
+            <div class="image-panel">
+                <div class="panel-title reference">🔴 CONNECT TO THIS PIECE</div>
+                <div class="image-container">
+                    <img id="refImage" alt="Reference piece">
+                </div>
+                <div class="piece-info" id="refInfo"></div>
+            </div>
+            
+            <!-- Suggested piece -->
+            <div class="image-panel">
+                <div class="panel-title suggestion">🟢 TRY THIS PIECE</div>
+                <div class="image-container">
+                    <img id="pieceImage" alt="Suggested piece">
+                </div>
+                <div class="piece-info" id="pieceInfo"></div>
+                
+                <!-- Controls -->
+                <div class="controls">
+                    <button class="btn-yes" onclick="handleFeedback(true)">
+                        ✓ It Fits!
+                    </button>
+                    <button class="btn-no" onclick="handleFeedback(false)">
+                        ✗ No Match
+                    </button>
+                    <button class="btn-skip" onclick="loadNextSuggestion()">
+                        ⊘ Skip
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script  src="app.js"></script>
+</body>
+</html>
