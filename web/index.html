@@ -9,7 +9,7 @@
 </head>
 <body>
     <div class="container">
-        <!-- Error message -->
+        <!-- Error/Success message -->
         <div class="error-message hidden" id="errorMessage">
             <span class="error-icon">⚠️</span>
             <span class="error-text" id="errorText"></span>
@@ -28,21 +28,143 @@
                 <span>Total: <strong id="stat-total">0</strong></span>
             </div>
         </div>
-        
-        <!-- Load panel (shown initially) -->
-        <div class="load-panel" id="loadPanel">
-            <h2>Load Puzzle Pieces</h2>
-            <div class="drop-zone" id="dropZone">
-                <p style="font-size: 18px; margin-bottom: 10px;">📂 Drop images here</p>
-                <p style="color: #666;">or click to browse</p>
-                <input type="file" id="fileInput" multiple accept="image/*" style="display: none;">
+
+        <!-- Step 1: Calibrate Puzzle State -->
+        <div class="calibration-step" id="step1">
+            <h2>Step 1: Load Puzzle State (the hole to fill)</h2>
+            <div class="step-content">
+                <div class="upload-section">
+                    <div class="drop-zone" id="dropZonePuzzle">
+                        <p>📷 Drop puzzle state image here</p>
+                        <p style="color: #666;">or click to browse</p>
+                        <input type="file" id="fileInputPuzzle" accept="image/*" style="display: none;">
+                    </div>
+                    <button class="btn-load" onclick="document.getElementById('fileInputPuzzle').click()">
+                        Browse File
+                    </button>
+                </div>
+
+                <div class="calibration-panel hidden" id="calibPuzzlePanel">
+                    <div class="calib-controls">
+                        <h3>Calibration Tools</h3>
+                        <div class="checkbox-group">
+                            <label>
+                                <input type="checkbox" id="debugPuzzle"> Show Debug (Contours)
+                            </label>
+                        </div>
+                        <div class="calib-buttons">
+                            <button class="btn-calib" id="btnSelectROIPuzzle">1. Select ROI</button>
+                            <button class="btn-calib" id="btnSelectBgPuzzle">2. Select Background</button>
+                            <button class="btn-calib disabled" id="btnPreviewPuzzle">Preview Detection</button>
+                        </div>
+                        <div class="calib-params">
+                            <label>Min Area: <input type="number" id="minAreaPuzzle" value="500" min="10"></label>
+                            <label>Max Area: <input type="number" id="maxAreaPuzzle" value="50000" min="100"></label>
+                        </div>
+                    </div>
+
+                    <div class="image-preview">
+                        <canvas id="canvasPuzzle"></canvas>
+                        <img id="previewPuzzle" style="display: none;">
+                    </div>
+
+                    <div class="calib-status">
+                        <span id="statusPuzzle">Upload an image to start</span>
+                    </div>
+
+                    <button class="btn-next" id="btnNextStep1">Next: Load Available Pieces →</button>
+                </div>
             </div>
-            <button class="btn-load" onclick="document.getElementById('fileInput').click()">
-                Browse Files
-            </button>
         </div>
-        
-        <!-- Main content (hidden initially) -->
+
+        <!-- Step 2: Calibrate Available Pieces -->
+        <div class="calibration-step hidden" id="step2">
+            <h2>Step 2: Load Available Pieces</h2>
+            <div class="step-content">
+                <div class="upload-section">
+                    <div class="drop-zone" id="dropZonePieces">
+                        <p>📷 Drop available pieces images here</p>
+                        <p style="color: #666;">or click to browse (multiple files)</p>
+                        <input type="file" id="fileInputPieces" multiple accept="image/*" style="display: none;">
+                    </div>
+                    <button class="btn-load" onclick="document.getElementById('fileInputPieces').click()">
+                        Browse Files
+                    </button>
+                </div>
+
+                <div class="calibration-panel hidden" id="calibPiecesPanel">
+                    <div class="calib-controls">
+                        <h3>Calibration Tools</h3>
+                        <div class="checkbox-group">
+                            <label>
+                                <input type="checkbox" id="debugPieces"> Show Debug (Contours)
+                            </label>
+                        </div>
+                        <div class="calib-buttons">
+                            <button class="btn-calib" id="btnSelectROIPieces">1. Select ROI</button>
+                            <button class="btn-calib" id="btnSelectBgPieces">2. Select Background</button>
+                            <button class="btn-calib disabled" id="btnPreviewPieces">Preview Detection</button>
+                        </div>
+                        <div class="calib-params">
+                            <label>Min Area: <input type="number" id="minAreaPieces" value="500" min="10"></label>
+                            <label>Max Area: <input type="number" id="maxAreaPieces" value="50000" min="100"></label>
+                        </div>
+                        <div class="file-selector">
+                            <label>Preview file:
+                                <select id="fileSelectPieces"></select>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="image-preview">
+                        <canvas id="canvasPieces"></canvas>
+                        <img id="previewPieces" style="display: none;">
+                    </div>
+
+                    <div class="calib-status">
+                        <span id="statusPieces">Upload images to start</span>
+                    </div>
+
+                    <button class="btn-back" id="btnBackStep2">← Back</button>
+                    <button class="btn-next" id="btnNextStep2">Next: Validate & Start →</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Step 3: Validation & Start -->
+        <div class="calibration-step hidden" id="step3">
+            <h2>Step 3: Validation & Start Solving</h2>
+            <div class="step-content">
+                <div class="validation-summary">
+                    <div class="summary-card">
+                        <h3>Puzzle State</h3>
+                        <div id="summaryPuzzle">
+                            <p>Pieces detected: <strong id="puzzlePiecesCount">0</strong></p>
+                        </div>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Available Pieces</h3>
+                        <div id="summaryPieces">
+                            <p>Pieces detected: <strong id="availablePiecesCount">0</strong></p>
+                            <p>Images loaded: <strong id="availableImagesCount">0</strong></p>
+                        </div>
+                    </div>
+                    <div class="summary-card">
+                        <h3>Total</h3>
+                        <div id="summaryTotal">
+                            <p>Total pieces: <strong id="totalPiecesCount">0</strong></p>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="validation-actions">
+                    <button class="btn-back" id="btnBackStep3">← Back</button>
+                    <button class="btn-start" id="btnStartSolving">🚀 Start Solving!</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main content (solving interface - shown after step 3) -->
         <div class="main-content hidden" id="mainContent">
             <!-- Reference piece -->
             <div class="image-panel">
@@ -52,7 +174,7 @@
                 </div>
                 <div class="piece-info" id="refInfo"></div>
             </div>
-            
+
             <!-- Suggested piece -->
             <div class="image-panel">
                 <div class="panel-title suggestion">🟢 TRY THIS PIECE</div>
@@ -60,7 +182,7 @@
                     <img id="pieceImage" alt="Suggested piece">
                 </div>
                 <div class="piece-info" id="pieceInfo"></div>
-                
+
                 <!-- Controls -->
                 <div class="controls">
                     <button class="btn-yes" onclick="handleFeedback(true)">
@@ -76,7 +198,7 @@
             </div>
         </div>
     </div>
-    
-    <script  src="app.js"></script>
+
+    <script src="app.js"></script>
 </body>
 </html>

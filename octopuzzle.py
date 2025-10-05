@@ -27,6 +27,19 @@ import os
 # ============================================================================
 
 @dataclass
+class CalibrationData:
+    roi: Optional[Tuple[int, int, int, int]] = None  # (x, y, w, h)
+    background_sample: Optional[Tuple[int, int, int]] = None  # BGR color
+    piece_samples: List[Tuple[int, int, int, int]] = None  # List of piece bboxes
+    min_area: int = 500
+    max_area: int = 50000
+
+    def __post_init__(self):
+        if self.piece_samples is None:
+            self.piece_samples = []
+
+
+@dataclass
 class PuzzlePiece:
     id: int
     source_image: str
@@ -35,7 +48,8 @@ class PuzzlePiece:
     width: float
     height: float
     tabs: List[int]
-    
+    piece_type: str = "available"  # "puzzle_state" or "available"
+
     def to_dict(self):
         return {
             'id': self.id,
@@ -44,42 +58,143 @@ class PuzzlePiece:
             'category': self.category,
             'width': self.width,
             'height': self.height,
-            'tabs': self.tabs
+            'tabs': self.tabs,
+            'piece_type': self.piece_type
         }
 
 
 class PuzzlePieceDetector:
-    def __init__(self, min_area=500, max_area=50000):
+    def __init__(self, min_area=500, max_area=50000, calibration: Optional[CalibrationData] = None):
         self.min_area = min_area
         self.max_area = max_area
-    
-    def detect_pieces(self, image_path: str) -> List[PuzzlePiece]:
+        self.calibration = calibration or CalibrationData()
+
+    def detect_pieces(self, image_path: str, piece_type: str = "available") -> List[PuzzlePiece]:
         img = cv2.imread(image_path)
+
+        # Apply ROI if calibrated
+        if self.calibration.roi:
+            x, y, w, h = self.calibration.roi
+            img = img[y:y+h, x:x+w]
+
+        # Preprocessing
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Background removal if calibrated
+        if self.calibration.background_sample:
+            img_masked = self._remove_background(img, self.calibration.background_sample)
+            gray = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
+
+        # Thresholding
         _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Find contours
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
+
         pieces = []
         piece_id = 0
-        
+
         for contour in contours:
             area = cv2.contourArea(contour)
-            if self.min_area < area < self.max_area:
-                piece = self._analyze_piece(contour, piece_id, image_path)
+            if self.calibration.min_area < area < self.calibration.max_area:
+                piece = self._analyze_piece(contour, piece_id, image_path, piece_type)
                 if piece:
                     pieces.append(piece)
                     piece_id += 1
-        
+
         return pieces
+
+    def detect_with_debug(self, image_path: str) -> Tuple[List[PuzzlePiece], str]:
+        """Detect pieces and return debug image with contours drawn"""
+        img = cv2.imread(image_path)
+        original = img.copy()
+
+        # Apply ROI if calibrated
+        roi_offset = (0, 0)
+        if self.calibration.roi:
+            x, y, w, h = self.calibration.roi
+            img = img[y:y+h, x:x+w]
+            roi_offset = (x, y)
+            # Draw ROI on original
+            cv2.rectangle(original, (x, y), (x+w, y+h), (255, 0, 255), 3)
+
+        # Preprocessing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Background removal if calibrated
+        if self.calibration.background_sample:
+            img_masked = self._remove_background(img, self.calibration.background_sample)
+            gray = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
+
+        # Thresholding
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        pieces = []
+        piece_id = 0
+
+        # Draw all contours
+        debug_img = img.copy() if not self.calibration.roi else original.copy()
+
+        for i, contour in enumerate(contours):
+            area = cv2.contourArea(contour)
+
+            # Adjust contour coordinates for ROI
+            contour_adjusted = contour.copy()
+            if self.calibration.roi:
+                contour_adjusted[:, 0, 0] += roi_offset[0]
+                contour_adjusted[:, 0, 1] += roi_offset[1]
+
+            if self.calibration.min_area < area < self.calibration.max_area:
+                # Valid piece - draw in green
+                cv2.drawContours(debug_img, [contour_adjusted], -1, (0, 255, 0), 3)
+                x, y, w, h = cv2.boundingRect(contour)
+                piece = self._analyze_piece(contour, piece_id, image_path, "available")
+                if piece:
+                    pieces.append(piece)
+                    # Draw piece ID
+                    text_x = x + roi_offset[0]
+                    text_y = y + roi_offset[1]
+                    cv2.putText(debug_img, f"#{piece_id}", (text_x, text_y-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    piece_id += 1
+            else:
+                # Invalid piece (too small/large) - draw in red
+                cv2.drawContours(debug_img, [contour_adjusted], -1, (0, 0, 255), 2)
+                cv2.putText(debug_img, f"Area:{int(area)}",
+                           (contour_adjusted[0][0][0], contour_adjusted[0][0][1]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        # Add info text
+        cv2.putText(debug_img, f"Found {len(pieces)} pieces | {len(contours)} contours total",
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+
+        # Convert to base64
+        _, buffer = cv2.imencode('.jpg', debug_img)
+        img_base64 = base64.b64encode(buffer).decode('utf-8')
+        debug_image = f"data:image/jpeg;base64,{img_base64}"
+
+        return pieces, debug_image
+
+    def _remove_background(self, img, bg_color: Tuple[int, int, int], tolerance=30):
+        """Remove background based on color sample"""
+        lower = np.array([max(0, c - tolerance) for c in bg_color])
+        upper = np.array([min(255, c + tolerance) for c in bg_color])
+        mask = cv2.inRange(img, lower, upper)
+        mask_inv = cv2.bitwise_not(mask)
+        result = cv2.bitwise_and(img, img, mask=mask_inv)
+        return result
     
-    def _analyze_piece(self, contour, piece_id: int, source: str) -> Optional[PuzzlePiece]:
+    def _analyze_piece(self, contour, piece_id: int, source: str, piece_type: str = "available") -> Optional[PuzzlePiece]:
         x, y, w, h = cv2.boundingRect(contour)
         diag = np.sqrt(w**2 + h**2)
         norm_w = w / diag
         norm_h = h / diag
         tabs = self._detect_tabs(contour, x, y, w, h)
         category = self._compute_category(tabs)
-        
+
         return PuzzlePiece(
             id=piece_id,
             source_image=source,
@@ -87,7 +202,8 @@ class PuzzlePieceDetector:
             category=category,
             width=norm_w,
             height=norm_h,
-            tabs=tabs
+            tabs=tabs,
+            piece_type=piece_type
         )
     
     def _detect_tabs(self, contour, x, y, w, h) -> List[int]:
@@ -262,6 +378,10 @@ class PuzzleSolver:
 detector = None
 solver = None
 images_cache = {}
+puzzle_state_pieces = []  # Pieces from puzzle state image
+available_pieces = []     # Pieces from available pieces images
+puzzle_calibration = CalibrationData()
+pieces_calibration = CalibrationData()
 
 def image_to_base64(image_path: str, bbox: Optional[Tuple[int, int, int, int]] = None, 
                     highlight_color: Tuple[int, int, int] = (0, 255, 0)) -> str:
@@ -355,6 +475,145 @@ def submit_feedback(piece_id: int, ref_piece_id: int, side: int, fits: bool, pos
         solver.reject_match(ref_piece_id, side, piece_id)
     
     return True
+
+
+@eel.expose
+def set_puzzle_calibration(calibration_dict: dict):
+    """Set calibration data for puzzle state image"""
+    global puzzle_calibration
+    puzzle_calibration = CalibrationData(
+        roi=tuple(calibration_dict['roi']) if calibration_dict.get('roi') else None,
+        background_sample=tuple(calibration_dict['background_sample']) if calibration_dict.get('background_sample') else None,
+        piece_samples=calibration_dict.get('piece_samples', []),
+        min_area=calibration_dict.get('min_area', 500),
+        max_area=calibration_dict.get('max_area', 50000)
+    )
+    return True
+
+
+@eel.expose
+def set_pieces_calibration(calibration_dict: dict):
+    """Set calibration data for available pieces images"""
+    global pieces_calibration
+    pieces_calibration = CalibrationData(
+        roi=tuple(calibration_dict['roi']) if calibration_dict.get('roi') else None,
+        background_sample=tuple(calibration_dict['background_sample']) if calibration_dict.get('background_sample') else None,
+        piece_samples=calibration_dict.get('piece_samples', []),
+        min_area=calibration_dict.get('min_area', 500),
+        max_area=calibration_dict.get('max_area', 50000)
+    )
+    return True
+
+
+@eel.expose
+def get_debug_preview(image_path: str, calibration_dict: dict):
+    """Get debug preview with contours for an image"""
+    if not os.path.exists(image_path):
+        return None
+
+    calibration = CalibrationData(
+        roi=tuple(calibration_dict['roi']) if calibration_dict.get('roi') else None,
+        background_sample=tuple(calibration_dict['background_sample']) if calibration_dict.get('background_sample') else None,
+        piece_samples=calibration_dict.get('piece_samples', []),
+        min_area=calibration_dict.get('min_area', 500),
+        max_area=calibration_dict.get('max_area', 50000)
+    )
+
+    detector_temp = PuzzlePieceDetector(calibration=calibration)
+    pieces, debug_image = detector_temp.detect_with_debug(image_path)
+
+    return {
+        'debug_image': debug_image,
+        'pieces_count': len(pieces),
+        'pieces': [p.to_dict() for p in pieces]
+    }
+
+
+@eel.expose
+def get_background_color(image_path: str, roi: list):
+    """Get average background color from a region"""
+    if not os.path.exists(image_path):
+        return None
+
+    img = cv2.imread(image_path)
+    x, y, w, h = roi
+    roi_img = img[y:y+h, x:x+w]
+
+    # Calculate average color
+    avg_color = cv2.mean(roi_img)[:3]  # BGR
+
+    return {
+        'color': [int(c) for c in avg_color],
+        'color_rgb': [int(avg_color[2]), int(avg_color[1]), int(avg_color[0])]  # Convert to RGB
+    }
+
+
+@eel.expose
+def load_puzzle_state(image_path: str):
+    """Load puzzle state image"""
+    global puzzle_state_pieces, detector
+
+    if not os.path.exists(image_path):
+        return {'success': False, 'error': 'Image not found'}
+
+    detector = PuzzlePieceDetector(calibration=puzzle_calibration)
+    puzzle_state_pieces = detector.detect_pieces(image_path, piece_type="puzzle_state")
+    images_cache[image_path] = cv2.imread(image_path)
+
+    return {
+        'success': True,
+        'pieces_count': len(puzzle_state_pieces),
+        'pieces': [p.to_dict() for p in puzzle_state_pieces]
+    }
+
+
+@eel.expose
+def load_available_pieces(image_paths: List[str]):
+    """Load available pieces images"""
+    global available_pieces, detector
+
+    detector = PuzzlePieceDetector(calibration=pieces_calibration)
+    available_pieces = []
+
+    for img_path in image_paths:
+        if not os.path.exists(img_path):
+            continue
+
+        pieces = detector.detect_pieces(img_path, piece_type="available")
+        available_pieces.extend(pieces)
+        images_cache[img_path] = cv2.imread(img_path)
+
+    return {
+        'success': True,
+        'pieces_count': len(available_pieces),
+        'pieces': [p.to_dict() for p in available_pieces]
+    }
+
+
+@eel.expose
+def start_solving():
+    """Initialize the solver with loaded pieces"""
+    global solver
+
+    all_pieces = puzzle_state_pieces + available_pieces
+
+    if not all_pieces:
+        return {'success': False, 'error': 'No pieces loaded'}
+
+    solver = PuzzleSolver(all_pieces)
+
+    # Place first piece from puzzle state (if any)
+    if puzzle_state_pieces:
+        solver.place_piece(puzzle_state_pieces[0].id, (0, 0))
+    elif available_pieces:
+        solver.place_piece(available_pieces[0].id, (0, 0))
+
+    return {
+        'success': True,
+        'total_pieces': len(all_pieces),
+        'puzzle_state_count': len(puzzle_state_pieces),
+        'available_count': len(available_pieces)
+    }
 
 
 @eel.expose
