@@ -9,6 +9,13 @@
 </head>
 <body>
     <div class="container">
+        <!-- Error message -->
+        <div class="error-message hidden" id="errorMessage">
+            <span class="error-icon">⚠️</span>
+            <span class="error-text" id="errorText"></span>
+            <button class="error-close" onclick="hideError()">✕</button>
+        </div>
+
         <!-- Header -->
         <div class="header">
             <h1>🧩 Puzzle Solver</h1>

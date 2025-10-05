@@ -45,15 +45,15 @@ async function handleFiles(files) {
         updateStats();
         loadNextSuggestion();
     } else {
-        alert('No pieces detected. Check image quality and thresholds.');
+        showError('No pieces detected. Check image quality and thresholds.');
     }
 }
 
 async function loadNextSuggestion() {
     const suggestion = await eel.get_suggestion()();
-    
+
     if (!suggestion) {
-        alert('Puzzle complete or no more suggestions!');
+        showError('Puzzle complete or no more suggestions!', 'success');
         return;
     }
     
@@ -110,13 +110,41 @@ async function handleFeedback(fits) {
 
 async function updateStats() {
     const stats = await eel.get_stats()();
-    
+
     if (stats) {
         document.getElementById('stat-placed').textContent = stats.placed;
         document.getElementById('stat-remaining').textContent = stats.remaining;
         document.getElementById('stat-total').textContent = stats.total;
-        
+
         const progress = (stats.placed / stats.total) * 100;
         document.getElementById('progress').style.width = progress + '%';
     }
+}
+
+function showError(message, type = 'error') {
+    const errorDiv = document.getElementById('errorMessage');
+    const errorText = document.getElementById('errorText');
+    const errorIcon = errorDiv.querySelector('.error-icon');
+
+    errorText.textContent = message;
+
+    // Change style based on type
+    if (type === 'success') {
+        errorDiv.style.background = 'linear-gradient(135deg, rgba(39, 174, 96, 0.9), rgba(34, 153, 84, 0.9))';
+        errorIcon.textContent = '✓';
+    } else {
+        errorDiv.style.background = 'linear-gradient(135deg, rgba(231, 76, 60, 0.9), rgba(192, 57, 43, 0.9))';
+        errorIcon.textContent = '⚠️';
+    }
+
+    errorDiv.classList.remove('hidden');
+
+    // Auto-hide after 5 seconds
+    setTimeout(() => {
+        hideError();
+    }, 5000);
+}
+
+function hideError() {
+    document.getElementById('errorMessage').classList.add('hidden');
 }
