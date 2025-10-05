@@ -53,13 +53,25 @@
                             </label>
                         </div>
                         <div class="calib-buttons">
-                            <button class="btn-calib" id="btnSelectROIPuzzle">1. Select ROI</button>
+                            <button class="btn-calib" id="btnSelectROIPuzzle">1. Select Fill Zone</button>
                             <button class="btn-calib" id="btnSelectBgPuzzle">2. Select Background</button>
                             <button class="btn-calib disabled" id="btnPreviewPuzzle">Preview Detection</button>
                         </div>
                         <div class="calib-params">
-                            <label>Min Area: <input type="number" id="minAreaPuzzle" value="500" min="10"></label>
-                            <label>Max Area: <input type="number" id="maxAreaPuzzle" value="50000" min="100"></label>
+                            <label title="Minimum contour area in pixels² to detect as a piece">
+                                Min Area: <input type="number" id="minAreaPuzzle" value="500" min="10">
+                            </label>
+                            <label title="Maximum contour area in pixels² to detect as a piece">
+                                Max Area: <input type="number" id="maxAreaPuzzle" value="50000" min="100">
+                            </label>
+                        </div>
+
+                        <!-- Calibration Status Display -->
+                        <div id="calibStatusPuzzle" class="calib-status-display">
+                            <div class="calib-status-items">
+                                <div class="status-item status-none">○ Fill Zone: Not set</div>
+                                <div class="status-item status-none">○ Background: Not set</div>
+                            </div>
                         </div>
                     </div>
 
@@ -95,6 +107,9 @@
                 <div class="calibration-panel hidden" id="calibPiecesPanel">
                     <div class="calib-controls">
                         <h3>Calibration Tools</h3>
+                        <p style="color: #95a5a6; font-size: 0.9em; margin: 5px 0 15px 0;">
+                            ℹ️ Calibration settings apply to all uploaded images
+                        </p>
                         <div class="checkbox-group">
                             <label>
                                 <input type="checkbox" id="debugPieces"> Show Debug (Contours)
@@ -106,13 +121,25 @@
                             <button class="btn-calib disabled" id="btnPreviewPieces">Preview Detection</button>
                         </div>
                         <div class="calib-params">
-                            <label>Min Area: <input type="number" id="minAreaPieces" value="500" min="10"></label>
-                            <label>Max Area: <input type="number" id="maxAreaPieces" value="50000" min="100"></label>
+                            <label title="Minimum contour area in pixels² to detect as a piece">
+                                Min Area: <input type="number" id="minAreaPieces" value="500" min="10">
+                            </label>
+                            <label title="Maximum contour area in pixels² to detect as a piece">
+                                Max Area: <input type="number" id="maxAreaPieces" value="50000" min="100">
+                            </label>
                         </div>
                         <div class="file-selector">
                             <label>Preview file:
                                 <select id="fileSelectPieces"></select>
                             </label>
+                        </div>
+
+                        <!-- Calibration Status Display -->
+                        <div id="calibStatusPieces" class="calib-status-display">
+                            <div class="calib-status-items">
+                                <div class="status-item status-none">○ ROI: Not set</div>
+                                <div class="status-item status-none">○ Background: Not set</div>
+                            </div>
                         </div>
                     </div>
 

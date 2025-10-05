@@ -85,8 +85,8 @@ class PuzzlePieceDetector:
             img_masked = self._remove_background(img, self.calibration.background_sample)
             gray = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
 
-        # Thresholding
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Thresholding (inverted so pieces are white, background is black)
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
         # Find contours
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -126,8 +126,18 @@ class PuzzlePieceDetector:
             img_masked = self._remove_background(img, self.calibration.background_sample)
             gray = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
 
-        # Thresholding
-        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Use adaptive threshold for better piece detection
+        # Apply Gaussian blur to reduce noise
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+
+        # Adaptive threshold works better for pieces on varying backgrounds
+        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY, 11, 2)
+
+        # Apply morphological operations to clean up
+        kernel = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
 
         # Find contours
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -167,9 +177,13 @@ class PuzzlePieceDetector:
                            (contour_adjusted[0][0][0], contour_adjusted[0][0][1]),
                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-        # Add info text
+        # Add info text and legend
         cv2.putText(debug_img, f"Found {len(pieces)} pieces | {len(contours)} contours total",
                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        cv2.putText(debug_img, f"Legend: GREEN=valid pieces | RED=rejected (area)",
+                   (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(debug_img, f"Area range: {self.calibration.min_area}-{self.calibration.max_area} px²",
+                   (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
 
         # Convert to base64
         _, buffer = cv2.imencode('.jpg', debug_img)
@@ -378,23 +392,46 @@ class PuzzleSolver:
 detector = None
 solver = None
 images_cache = {}
+image_data_cache = {}  # Cache for decoded base64 images
 puzzle_state_pieces = []  # Pieces from puzzle state image
 available_pieces = []     # Pieces from available pieces images
 puzzle_calibration = CalibrationData()
 pieces_calibration = CalibrationData()
 
-def image_to_base64(image_path: str, bbox: Optional[Tuple[int, int, int, int]] = None, 
+def decode_base64_image(base64_str: str) -> Optional[np.ndarray]:
+    """Decode base64 string to OpenCV image"""
+    try:
+        # Remove data URL prefix if present
+        if base64_str.startswith('data:image'):
+            base64_str = base64_str.split(',')[1]
+
+        # Decode base64
+        img_data = base64.b64decode(base64_str)
+
+        # Convert to numpy array
+        nparr = np.frombuffer(img_data, np.uint8)
+
+        # Decode image
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        return img
+    except Exception as e:
+        print(f"[ERROR] Failed to decode base64 image: {str(e)}")
+        return None
+
+
+def image_to_base64(image_path: str, bbox: Optional[Tuple[int, int, int, int]] = None,
                     highlight_color: Tuple[int, int, int] = (0, 255, 0)) -> str:
     """Convert image to base64 with optional bounding box highlight"""
     img = cv2.imread(image_path)
-    
+
     if bbox:
         x, y, w, h = bbox
         cv2.rectangle(img, (x, y), (x + w, y + h), highlight_color, 3)
-        
+
         # Add piece ID label
         cv2.rectangle(img, (x, y - 30), (x + 100, y), highlight_color, -1)
-    
+
     _, buffer = cv2.imencode('.jpg', img)
     img_base64 = base64.b64encode(buffer).decode('utf-8')
     return f"data:image/jpeg;base64,{img_base64}"
@@ -506,88 +543,172 @@ def set_pieces_calibration(calibration_dict: dict):
 
 
 @eel.expose
-def get_debug_preview(image_path: str, calibration_dict: dict):
-    """Get debug preview with contours for an image"""
-    if not os.path.exists(image_path):
+def get_debug_preview(image_data: str, calibration_dict: dict):
+    """Get debug preview with contours for an image (from base64)"""
+    print(f"[DEBUG] get_debug_preview called with base64 data (length: {len(image_data)})")
+    print(f"[DEBUG] Calibration: {calibration_dict}")
+
+    try:
+        # Decode base64 image
+        img = decode_base64_image(image_data)
+        if img is None:
+            print(f"[ERROR] Could not decode base64 image")
+            return None
+
+        # Save to temp file for detector (could be optimized later)
+        import tempfile
+        temp_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
+        cv2.imwrite(temp_path, img)
+
+        calibration = CalibrationData(
+            roi=tuple(calibration_dict['roi']) if calibration_dict.get('roi') else None,
+            background_sample=tuple(calibration_dict['background_sample']) if calibration_dict.get('background_sample') else None,
+            piece_samples=calibration_dict.get('piece_samples', []),
+            min_area=calibration_dict.get('min_area', 500),
+            max_area=calibration_dict.get('max_area', 50000)
+        )
+
+        detector_temp = PuzzlePieceDetector(calibration=calibration)
+        pieces, debug_image = detector_temp.detect_with_debug(temp_path)
+
+        # Clean up temp file
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+
+        print(f"[DEBUG] Detected {len(pieces)} pieces")
+
+        return {
+            'debug_image': debug_image,
+            'pieces_count': len(pieces),
+            'pieces': [p.to_dict() for p in pieces]
+        }
+    except Exception as e:
+        print(f"[ERROR] Exception in get_debug_preview: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
-
-    calibration = CalibrationData(
-        roi=tuple(calibration_dict['roi']) if calibration_dict.get('roi') else None,
-        background_sample=tuple(calibration_dict['background_sample']) if calibration_dict.get('background_sample') else None,
-        piece_samples=calibration_dict.get('piece_samples', []),
-        min_area=calibration_dict.get('min_area', 500),
-        max_area=calibration_dict.get('max_area', 50000)
-    )
-
-    detector_temp = PuzzlePieceDetector(calibration=calibration)
-    pieces, debug_image = detector_temp.detect_with_debug(image_path)
-
-    return {
-        'debug_image': debug_image,
-        'pieces_count': len(pieces),
-        'pieces': [p.to_dict() for p in pieces]
-    }
 
 
 @eel.expose
-def get_background_color(image_path: str, roi: list):
-    """Get average background color from a region"""
-    if not os.path.exists(image_path):
+def get_background_color(image_data: str, roi: list):
+    """Get average background color from a region (from base64)"""
+    print(f"[DEBUG] get_background_color called with base64 data (length: {len(image_data)})")
+    print(f"[DEBUG] ROI: {roi}")
+
+    try:
+        # Decode base64 image
+        img = decode_base64_image(image_data)
+        if img is None:
+            print(f"[ERROR] Could not decode base64 image")
+            return None
+
+        x, y, w, h = roi
+        roi_img = img[y:y+h, x:x+w]
+
+        # Calculate average color
+        avg_color = cv2.mean(roi_img)[:3]  # BGR
+
+        result = {
+            'color': [int(c) for c in avg_color],
+            'color_rgb': [int(avg_color[2]), int(avg_color[1]), int(avg_color[0])]  # Convert to RGB
+        }
+        print(f"[DEBUG] Background color result: {result}")
+        return result
+    except Exception as e:
+        print(f"[ERROR] Exception in get_background_color: {str(e)}")
+        import traceback
+        traceback.print_exc()
         return None
-
-    img = cv2.imread(image_path)
-    x, y, w, h = roi
-    roi_img = img[y:y+h, x:x+w]
-
-    # Calculate average color
-    avg_color = cv2.mean(roi_img)[:3]  # BGR
-
-    return {
-        'color': [int(c) for c in avg_color],
-        'color_rgb': [int(avg_color[2]), int(avg_color[1]), int(avg_color[0])]  # Convert to RGB
-    }
 
 
 @eel.expose
-def load_puzzle_state(image_path: str):
-    """Load puzzle state image"""
+def load_puzzle_state(image_data: str):
+    """Load puzzle state image from base64"""
     global puzzle_state_pieces, detector
 
-    if not os.path.exists(image_path):
-        return {'success': False, 'error': 'Image not found'}
+    print(f"[DEBUG] load_puzzle_state called with base64 data (length: {len(image_data)})")
 
-    detector = PuzzlePieceDetector(calibration=puzzle_calibration)
-    puzzle_state_pieces = detector.detect_pieces(image_path, piece_type="puzzle_state")
-    images_cache[image_path] = cv2.imread(image_path)
+    try:
+        # Decode base64 image
+        img = decode_base64_image(image_data)
+        if img is None:
+            return {'success': False, 'error': 'Could not decode image'}
 
-    return {
-        'success': True,
-        'pieces_count': len(puzzle_state_pieces),
-        'pieces': [p.to_dict() for p in puzzle_state_pieces]
-    }
+        # Save to temp file for detector
+        import tempfile
+        temp_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
+        cv2.imwrite(temp_path, img)
+
+        detector = PuzzlePieceDetector(calibration=puzzle_calibration)
+        puzzle_state_pieces = detector.detect_pieces(temp_path, piece_type="puzzle_state")
+        images_cache[temp_path] = img
+
+        # Don't delete temp file - we need it for image_to_base64 later
+        # The file will be cleaned up on program exit
+
+        print(f"[DEBUG] Loaded {len(puzzle_state_pieces)} puzzle state pieces")
+
+        return {
+            'success': True,
+            'pieces_count': len(puzzle_state_pieces),
+            'pieces': [p.to_dict() for p in puzzle_state_pieces]
+        }
+    except Exception as e:
+        print(f"[ERROR] Exception in load_puzzle_state: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {'success': False, 'error': str(e)}
 
 
 @eel.expose
-def load_available_pieces(image_paths: List[str]):
-    """Load available pieces images"""
+def load_available_pieces(images_data: List[str]):
+    """Load available pieces images from base64 list"""
     global available_pieces, detector
 
-    detector = PuzzlePieceDetector(calibration=pieces_calibration)
-    available_pieces = []
+    print(f"[DEBUG] load_available_pieces called with {len(images_data)} images")
 
-    for img_path in image_paths:
-        if not os.path.exists(img_path):
-            continue
+    try:
+        detector = PuzzlePieceDetector(calibration=pieces_calibration)
+        available_pieces = []
 
-        pieces = detector.detect_pieces(img_path, piece_type="available")
-        available_pieces.extend(pieces)
-        images_cache[img_path] = cv2.imread(img_path)
+        import tempfile
 
-    return {
-        'success': True,
-        'pieces_count': len(available_pieces),
-        'pieces': [p.to_dict() for p in available_pieces]
-    }
+        for i, image_data in enumerate(images_data):
+            print(f"[DEBUG] Processing image {i+1}/{len(images_data)}")
+
+            # Decode base64 image
+            img = decode_base64_image(image_data)
+            if img is None:
+                print(f"[WARN] Could not decode image {i+1}, skipping")
+                continue
+
+            # Save to temp file for detector
+            temp_path = tempfile.NamedTemporaryFile(delete=False, suffix='.jpg').name
+            cv2.imwrite(temp_path, img)
+
+            pieces = detector.detect_pieces(temp_path, piece_type="available")
+            available_pieces.extend(pieces)
+            images_cache[temp_path] = img
+
+            # Don't delete temp file - we need it for image_to_base64 later
+            # The file will be cleaned up on program exit
+
+            print(f"[DEBUG] Image {i+1}: found {len(pieces)} pieces")
+
+        print(f"[DEBUG] Total available pieces: {len(available_pieces)}")
+
+        return {
+            'success': True,
+            'pieces_count': len(available_pieces),
+            'pieces': [p.to_dict() for p in available_pieces]
+        }
+    except Exception as e:
+        print(f"[ERROR] Exception in load_available_pieces: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {'success': False, 'error': str(e)}
 
 
 @eel.expose

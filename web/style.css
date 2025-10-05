@@ -440,9 +440,10 @@ button:active {
     background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
     color: white;
     box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3);
+    position: relative;
 }
 
-.btn-calib:hover:not(.disabled) {
+.btn-calib:hover:not(.disabled):not(.active) {
     transform: translateY(-2px);
     box-shadow: 0 6px 20px rgba(102, 126, 234, 0.4);
 }
@@ -450,6 +451,17 @@ button:active {
 .btn-calib.disabled {
     opacity: 0.5;
     cursor: not-allowed;
+}
+
+.btn-calib.active {
+    background: linear-gradient(135deg, #51cf66 0%, #37b24d 100%);
+    box-shadow: 0 0 20px rgba(81, 207, 102, 0.6), 0 4px 15px rgba(0, 0, 0, 0.3);
+    transform: scale(1.05);
+}
+
+.btn-calib.active::before {
+    content: '● ';
+    margin-right: 5px;
 }
 
 .calib-params {
@@ -524,6 +536,41 @@ button:active {
     text-align: center;
     color: #e0e0e0;
     font-size: 14px;
+}
+
+.calib-status-display {
+    margin-top: 15px;
+    padding: 15px;
+    background: rgba(0, 0, 0, 0.3);
+    border-radius: 8px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+}
+
+.calib-status-items {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.status-item {
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+}
+
+.status-item.status-ok {
+    background: rgba(39, 174, 96, 0.2);
+    border: 1px solid rgba(39, 174, 96, 0.4);
+    color: #51cf66;
+}
+
+.status-item.status-none {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: #888;
 }
 
 .btn-next,
