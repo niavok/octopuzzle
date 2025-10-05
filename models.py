@@ -1,0 +1,382 @@
+"""
+Puzzle Solver - Data Models and Business Logic
+Contains: CalibrationData, PuzzlePiece, Detector, Matcher, Solver
+"""
+
+import cv2
+import numpy as np
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
+from collections import defaultdict
+
+
+@dataclass
+class CalibrationData:
+    """Calibration settings for piece detection"""
+    roi: Optional[Tuple[int, int, int, int]] = None  # (x, y, w, h)
+    background_sample: Optional[Tuple[int, int, int]] = None  # BGR color
+    min_area: int = 500
+    max_area: int = 50000
+
+
+@dataclass
+class PuzzlePiece:
+    """Represents a detected puzzle piece"""
+    id: int
+    source_image: str  # Path to source image
+    bbox_in_source: Tuple[int, int, int, int]  # (x, y, w, h)
+    category: int  # Based on tab configuration
+    width: float  # Normalized width
+    height: float  # Normalized height
+    tabs: List[int]  # [top, right, bottom, left]: 1=out, -1=in, 0=flat
+    piece_type: str = "available"  # "puzzle_state" or "available"
+
+
+class PuzzlePieceDetector:
+    """Detects puzzle pieces in images using OpenCV"""
+
+    def __init__(self, calibration: Optional[CalibrationData] = None):
+        self.calibration = calibration or CalibrationData()
+
+    def detect_pieces(self, image_path: str, piece_type: str = "available") -> List[PuzzlePiece]:
+        """Detect all pieces in an image"""
+        img = cv2.imread(image_path)
+        if img is None:
+            return []
+
+        # Apply ROI if calibrated
+        roi_offset = (0, 0)
+        if self.calibration.roi:
+            x, y, w, h = self.calibration.roi
+            img = img[y:y+h, x:x+w]
+            roi_offset = (x, y)
+
+        # Preprocessing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Background removal if calibrated
+        if self.calibration.background_sample:
+            img_masked = self._remove_background(img, self.calibration.background_sample)
+            gray = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
+
+        # Adaptive threshold for better piece detection
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY, 11, 2)
+
+        # Morphological operations to clean up
+        kernel = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        pieces = []
+        piece_id = 0
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            if self.calibration.min_area < area < self.calibration.max_area:
+                piece = self._analyze_piece(contour, piece_id, image_path, piece_type, roi_offset)
+                if piece:
+                    pieces.append(piece)
+                    piece_id += 1
+
+        return pieces
+
+    def detect_with_debug(self, image_path: str) -> Tuple[List[PuzzlePiece], np.ndarray]:
+        """Detect pieces and return debug image with contours"""
+        img = cv2.imread(image_path)
+        if img is None:
+            return [], None
+
+        original = img.copy()
+
+        # Apply ROI if calibrated
+        roi_offset = (0, 0)
+        if self.calibration.roi:
+            x, y, w, h = self.calibration.roi
+            img = img[y:y+h, x:x+w]
+            roi_offset = (x, y)
+            # Draw ROI on original
+            cv2.rectangle(original, (x, y), (x+w, y+h), (255, 0, 255), 3)
+
+        # Preprocessing
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+        # Background removal if calibrated
+        if self.calibration.background_sample:
+            img_masked = self._remove_background(img, self.calibration.background_sample)
+            gray = cv2.cvtColor(img_masked, cv2.COLOR_BGR2GRAY)
+
+        # Adaptive threshold
+        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+        binary = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY, 11, 2)
+
+        # Morphological operations
+        kernel = np.ones((3, 3), np.uint8)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
+
+        # Find contours
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        pieces = []
+        piece_id = 0
+
+        # Draw all contours on original image
+        debug_img = original.copy()
+
+        for contour in contours:
+            area = cv2.contourArea(contour)
+
+            # Adjust contour coordinates for ROI
+            contour_adjusted = contour.copy()
+            if self.calibration.roi:
+                contour_adjusted[:, 0, 0] += roi_offset[0]
+                contour_adjusted[:, 0, 1] += roi_offset[1]
+
+            if self.calibration.min_area < area < self.calibration.max_area:
+                # Valid piece - draw in green
+                cv2.drawContours(debug_img, [contour_adjusted], -1, (0, 255, 0), 3)
+                piece = self._analyze_piece(contour, piece_id, "", "available", roi_offset)
+                if piece:
+                    pieces.append(piece)
+                    # Draw piece ID
+                    x, y, w, h = cv2.boundingRect(contour)
+                    text_x = x + roi_offset[0]
+                    text_y = y + roi_offset[1]
+                    cv2.putText(debug_img, f"#{piece_id}", (text_x, text_y-10),
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                    piece_id += 1
+            else:
+                # Invalid piece (too small/large) - draw in red
+                cv2.drawContours(debug_img, [contour_adjusted], -1, (0, 0, 255), 2)
+                cv2.putText(debug_img, f"Area:{int(area)}",
+                           (contour_adjusted[0][0][0], contour_adjusted[0][0][1]),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+        # Add legend
+        cv2.putText(debug_img, f"Found {len(pieces)} pieces | {len(contours)} contours total",
+                   (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+        cv2.putText(debug_img, f"Legend: GREEN=valid pieces | RED=rejected (area)",
+                   (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(debug_img, f"Area range: {self.calibration.min_area}-{self.calibration.max_area} px²",
+                   (10, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+        return pieces, debug_img
+
+    def _remove_background(self, img, bg_color: Tuple[int, int, int], tolerance=30):
+        """Remove background based on color sample"""
+        lower = np.array([max(0, c - tolerance) for c in bg_color])
+        upper = np.array([min(255, c + tolerance) for c in bg_color])
+        mask = cv2.inRange(img, lower, upper)
+        mask_inv = cv2.bitwise_not(mask)
+        result = cv2.bitwise_and(img, img, mask=mask_inv)
+        return result
+
+    def _analyze_piece(self, contour, piece_id: int, source: str, piece_type: str, roi_offset=(0, 0)) -> Optional[PuzzlePiece]:
+        """Analyze contour to extract piece information"""
+        x, y, w, h = cv2.boundingRect(contour)
+
+        # Adjust for ROI offset
+        x += roi_offset[0]
+        y += roi_offset[1]
+
+        diag = np.sqrt(w**2 + h**2)
+        norm_w = w / diag if diag > 0 else 0
+        norm_h = h / diag if diag > 0 else 0
+
+        tabs = self._detect_tabs(contour, x - roi_offset[0], y - roi_offset[1], w, h)
+        category = self._compute_category(tabs)
+
+        return PuzzlePiece(
+            id=piece_id,
+            source_image=source,
+            bbox_in_source=(x, y, w, h),
+            category=category,
+            width=norm_w,
+            height=norm_h,
+            tabs=tabs,
+            piece_type=piece_type
+        )
+
+    def _detect_tabs(self, contour, x, y, w, h) -> List[int]:
+        """Detect tabs on each side: 1=out, -1=in, 0=flat"""
+        tabs = [0, 0, 0, 0]
+        contour_points = contour.reshape(-1, 2)
+
+        # Top
+        top_points = contour_points[contour_points[:, 1] < y + h * 0.3]
+        if len(top_points) > 0:
+            min_y = top_points[:, 1].min()
+            if min_y < y - 2:
+                tabs[0] = 1
+            elif abs(min_y - y) < 2:
+                tabs[0] = 0
+            else:
+                tabs[0] = -1
+
+        # Right
+        right_points = contour_points[contour_points[:, 0] > x + w * 0.7]
+        if len(right_points) > 0:
+            max_x = right_points[:, 0].max()
+            if max_x > x + w + 2:
+                tabs[1] = 1
+            elif abs(max_x - (x + w)) < 2:
+                tabs[1] = 0
+            else:
+                tabs[1] = -1
+
+        # Bottom
+        bottom_points = contour_points[contour_points[:, 1] > y + h * 0.7]
+        if len(bottom_points) > 0:
+            max_y = bottom_points[:, 1].max()
+            if max_y > y + h + 2:
+                tabs[2] = 1
+            elif abs(max_y - (y + h)) < 2:
+                tabs[2] = 0
+            else:
+                tabs[2] = -1
+
+        # Left
+        left_points = contour_points[contour_points[:, 0] < x + w * 0.3]
+        if len(left_points) > 0:
+            min_x = left_points[:, 0].min()
+            if min_x < x - 2:
+                tabs[3] = 1
+            elif abs(min_x - x) < 2:
+                tabs[3] = 0
+            else:
+                tabs[3] = -1
+
+        return tabs
+
+    def _compute_category(self, tabs: List[int]) -> int:
+        """Compute piece category based on tab configuration"""
+        count = sum(1 for t in tabs if t != 0)
+
+        if count == 0:
+            return 0  # No tabs
+        elif count == 1:
+            return 1  # Corner
+        elif count == 2:
+            # Check if opposite sides
+            if (tabs[0] != 0 and tabs[2] != 0) or (tabs[1] != 0 and tabs[3] != 0):
+                return 3  # Opposite sides
+            else:
+                return 2  # Adjacent sides
+        elif count == 3:
+            return 4  # Three sides
+        else:
+            return 5  # All sides
+
+
+class PuzzleMatcher:
+    """Finds compatible pieces based on tab matching"""
+
+    def __init__(self, pieces: List[PuzzlePiece]):
+        self.pieces = pieces
+        self.by_category = defaultdict(list)
+        for piece in pieces:
+            self.by_category[piece.category].append(piece)
+
+    def find_compatible(self, piece: PuzzlePiece, side: int) -> List[Tuple[PuzzlePiece, int, float]]:
+        """Find pieces that can connect to given piece on given side"""
+        target_tab = piece.tabs[side]
+        if target_tab == 0:
+            return []
+
+        compatible = []
+        required_tab = -target_tab  # Opposite tab type
+
+        for candidate in self.pieces:
+            if candidate.id == piece.id:
+                continue
+
+            # Check all sides of candidate
+            for cand_side in range(4):
+                if candidate.tabs[cand_side] == required_tab:
+                    score = self._compute_match_score(piece, side, candidate, cand_side)
+                    if score > 0:
+                        compatible.append((candidate, cand_side, score))
+
+        compatible.sort(key=lambda x: x[2], reverse=True)
+        return compatible
+
+    def _compute_match_score(self, p1: PuzzlePiece, s1: int, p2: PuzzlePiece, s2: int) -> float:
+        """Compute compatibility score between two pieces"""
+        # For horizontal connections, check width similarity
+        if s1 in [0, 2]:  # Top or bottom
+            size_diff = abs(p1.width - p2.width)
+        else:  # Left or right
+            size_diff = abs(p1.height - p2.height)
+
+        if size_diff > 0.15:
+            return 0.0
+
+        score = 1.0 - size_diff * 5
+        return max(0, score)
+
+
+class PuzzleSolver:
+    """Manages puzzle solving state and suggestions"""
+
+    def __init__(self, pieces: List[PuzzlePiece]):
+        self.pieces = pieces
+        self.matcher = PuzzleMatcher(pieces)
+        self.solution = {}  # {(row, col): PuzzlePiece}
+        self.used = set()  # Set of piece IDs already placed
+        self.failed_matches = set()  # Failed match attempts
+
+    def get_best_suggestion(self):
+        """Get best next piece suggestion"""
+        all_suggestions = []
+
+        # For each placed piece, check all 4 sides
+        for (row, col), ref_piece in self.solution.items():
+            for drow, dcol, side in [(-1, 0, 0), (0, 1, 1), (1, 0, 2), (0, -1, 3)]:
+                neighbor_pos = (row + drow, col + dcol)
+
+                # Skip if position already filled
+                if neighbor_pos in self.solution:
+                    continue
+
+                # Find compatible pieces
+                candidates = self.matcher.find_compatible(ref_piece, side)
+
+                for piece, piece_side, score in candidates:
+                    # Skip if piece already used
+                    if piece.id in self.used:
+                        continue
+
+                    # Skip if this match was already rejected
+                    opposite_side = (side + 2) % 4
+                    if (ref_piece.id, side, piece.id, opposite_side) in self.failed_matches:
+                        continue
+
+                    all_suggestions.append({
+                        'position': neighbor_pos,
+                        'piece': piece,
+                        'side': side,
+                        'ref_piece': ref_piece,
+                        'score': score
+                    })
+
+        if not all_suggestions:
+            return None
+
+        return max(all_suggestions, key=lambda x: x['score'])
+
+    def place_piece(self, piece_id: int, pos: Tuple[int, int]):
+        """Place a piece at given position"""
+        piece = next(p for p in self.pieces if p.id == piece_id)
+        self.solution[pos] = piece
+        self.used.add(piece_id)
+
+    def reject_match(self, ref_piece_id: int, side: int, piece_id: int):
+        """Mark a match as failed"""
+        opposite_side = (side + 2) % 4
+        self.failed_matches.add((ref_piece_id, side, piece_id, opposite_side))
