@@ -43,6 +43,7 @@ Le dossier `test/` contient un exemple de « trou » et des photos de pièces ut
 - `widgets.py` – widgets personnalisés (canvas interactif, panneaux d’images, barre de stats)
 - `image_utils.py` – conversions OpenCV ↔ PIL ↔ interface graphique, mise en cache, visualisations
 - `assets/` – ressources (icônes) et script `generate_icon.py`
+- `docs/` – notes techniques (`hole_detection.md`) et journal (`progress.md`)
 - `test/` – images d’exemple
 
 ## Fonctionnalités actuelles

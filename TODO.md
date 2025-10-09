@@ -18,6 +18,8 @@
 - [ ] Permettre à l’utilisateur de choisir la pièce qu’il souhaite tester et proposer les meilleurs emplacements compatibles
 - [ ] Gérer plusieurs propositions simultanées : annotation numérotée sur les images + panneau récapitulatif
 - [ ] Enregistrer une trace de décision (pièce proposée, validée/rejetée, score) pour affiner les heuristiques
+- [ ] Stabiliser la recherche de lignes internes (réduire les faux positifs sur textures bois/nervures)
+- [ ] Détecter les concavités du trou afin de contraindre la grille estimée
 
 ## Détection & Calibration
 
@@ -25,6 +27,9 @@
 - [ ] Améliorer le filtrage des contours (bruit/échos lumineux) sans dépendre d’une ROI manuelle
 - [ ] Mettre en place un assistant de calibration automatique (estimation des limites min/max area)
 - [ ] Ajouter des métriques de qualité de détection (rapport pièces détectées / attendues) pour guider l’utilisateur
+- [x] Analyse directe du trou avec double ROI et debug multi-couches
+- [ ] Verrouiller le ROI externe sur le contour détecté (snap automatique)
+- [ ] Séparer le masque d’ombre des motifs internes (par ex. textures répétitives) pour limiter les remontées d’edges sur la zone complétée
 
 ## Persistance & Outils
 
