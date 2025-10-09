@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import cv2
 from typing import List, Optional
+from pathlib import Path
 
 from models import CalibrationData, PuzzlePiece, PuzzlePieceDetector, PuzzleSolver
 from widgets import (
@@ -21,6 +22,10 @@ from widgets import (
 )
 from image_utils import image_cache, extract_piece_image
 
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+ICON_PNG_PATH = ASSETS_DIR / "octopuzzle_icon.png"
+ICON_ICO_PATH = ASSETS_DIR / "octopuzzle_icon.ico"
+
 
 class OctopuzzleApp(tk.Tk):
     """Main application window."""
@@ -34,6 +39,9 @@ class OctopuzzleApp(tk.Tk):
         self.minsize(1080, 760)
 
         self.configure(bg=PALETTE["background"])
+
+        self.icon_image = None
+        self._configure_icon()
 
         # State
         self.puzzle_calibration = CalibrationData()
@@ -82,6 +90,22 @@ class OctopuzzleApp(tk.Tk):
         """Cleanup and close"""
         image_cache.cleanup()
         self.destroy()
+
+    def _configure_icon(self):
+        """Set custom window/taskbar icon when available."""
+        try:
+            if ICON_PNG_PATH.exists():
+                self.icon_image = tk.PhotoImage(file=str(ICON_PNG_PATH))
+                self.iconphoto(True, self.icon_image)
+        except Exception as exc:
+            print(f"[WARN] Unable to set PhotoImage icon: {exc}")
+
+        try:
+            if ICON_ICO_PATH.exists():
+                self.iconbitmap(default=str(ICON_ICO_PATH))
+        except Exception:
+            # Some platforms (e.g., macOS/Linux) don't support iconbitmap with ICO files.
+            pass
 
 
 class Step1Frame(tk.Frame):
