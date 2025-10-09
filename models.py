@@ -205,54 +205,60 @@ class PuzzlePieceDetector:
 
     def _detect_tabs(self, contour, x, y, w, h) -> List[int]:
         """Detect tabs on each side: 1=out, -1=in, 0=flat"""
-        tabs = [0, 0, 0, 0]
-        contour_points = contour.reshape(-1, 2)
+        if w <= 0 or h <= 0:
+            return [0, 0, 0, 0]
 
-        # Top
-        top_points = contour_points[contour_points[:, 1] < y + h * 0.3]
-        if len(top_points) > 0:
-            min_y = top_points[:, 1].min()
-            if min_y < y - 2:
-                tabs[0] = 1
-            elif abs(min_y - y) < 2:
-                tabs[0] = 0
-            else:
-                tabs[0] = -1
+        # Work on a binary mask of the contour so we can analyse per-side profiles
+        contour_local = contour.copy()
+        contour_local[:, 0, 0] -= x
+        contour_local[:, 0, 1] -= y
 
-        # Right
-        right_points = contour_points[contour_points[:, 0] > x + w * 0.7]
-        if len(right_points) > 0:
-            max_x = right_points[:, 0].max()
-            if max_x > x + w + 2:
-                tabs[1] = 1
-            elif abs(max_x - (x + w)) < 2:
-                tabs[1] = 0
-            else:
-                tabs[1] = -1
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.drawContours(mask, [contour_local], -1, 255, thickness=-1)
 
-        # Bottom
-        bottom_points = contour_points[contour_points[:, 1] > y + h * 0.7]
-        if len(bottom_points) > 0:
-            max_y = bottom_points[:, 1].max()
-            if max_y > y + h + 2:
-                tabs[2] = 1
-            elif abs(max_y - (y + h)) < 2:
-                tabs[2] = 0
-            else:
-                tabs[2] = -1
+        def classify(mask_side: np.ndarray) -> int:
+            """Return tab type for a mask oriented with the side facing 'up'."""
+            h_side, w_side = mask_side.shape
+            if h_side == 0 or w_side == 0:
+                return 0
 
-        # Left
-        left_points = contour_points[contour_points[:, 0] < x + w * 0.3]
-        if len(left_points) > 0:
-            min_x = left_points[:, 0].min()
-            if min_x < x - 2:
-                tabs[3] = 1
-            elif abs(min_x - x) < 2:
-                tabs[3] = 0
-            else:
-                tabs[3] = -1
+            start = int(w_side * 0.2)
+            end = int(w_side * 0.8)
+            if end <= start:
+                start, end = 0, w_side
 
-        return tabs
+            strip = mask_side[:, start:end] if (end - start) > 0 else mask_side
+            column_pixels = strip > 0
+            if column_pixels.size == 0 or not column_pixels.any():
+                return 0
+
+            valid_cols = column_pixels.any(axis=0)
+            if not valid_cols.any():
+                return 0
+
+            top_indices = np.argmax(column_pixels[:, valid_cols], axis=0)
+            max_depth = float(top_indices.max()) / max(h_side, 1)
+            mean_depth = float(top_indices.mean()) / max(h_side, 1)
+            coverage_ratio = float(valid_cols.sum()) / column_pixels.shape[1]
+
+            # Deep indent -> inward tab
+            if max_depth > 0.18 or mean_depth > 0.12:
+                return -1
+
+            # Narrow coverage -> outward tab
+            if coverage_ratio < 0.65:
+                return 1
+
+            return 0
+
+        tabs = [
+            classify(mask),                     # Top
+            classify(np.rot90(mask, k=1)),      # Right
+            classify(np.rot90(mask, k=2)),      # Bottom
+            classify(np.rot90(mask, k=-1))      # Left
+        ]
+
+        return [int(t) for t in tabs]
 
     def _compute_category(self, tabs: List[int]) -> int:
         """Compute piece category based on tab configuration"""

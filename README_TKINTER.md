@@ -1,5 +1,7 @@
 # Puzzle Solver - Tkinter Version
 
+> Cette version Tkinter est désormais la référence officielle du projet (la variante web a été supprimée).
+
 Version portée en Tkinter pour un débogage plus simple, sans séparation frontend/backend.
 
 ## Installation

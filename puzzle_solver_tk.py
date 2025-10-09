@@ -532,6 +532,11 @@ class Step2Frame(tk.Frame):
 
         # Initialize solver
         all_pieces = self.app.puzzle_pieces + self.app.available_pieces
+
+        # Ensure each piece has a unique identifier across puzzle & inventory
+        for idx, piece in enumerate(all_pieces):
+            piece.id = idx
+
         self.app.solver = PuzzleSolver(all_pieces)
 
         # Place first piece
