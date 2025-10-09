@@ -31,8 +31,8 @@ PALETTE = {
     "neutral": "#1f2a3d",
     "neutral_hover": "#23314a",
     "neutral_active": "#1b2435",
-    "disabled_bg": "#1b2333",
-    "disabled_fg": "#6b7280",
+    "disabled_bg": "#27344b",
+    "disabled_fg": "#a0acc2",
 }
 
 BUTTON_STYLES = {
@@ -56,11 +56,11 @@ def init_theme(root: tk.Misc) -> None:
         pass
 
     root.configure(bg=PALETTE["background"])
-    root.option_add("*Font", "Segoe UI 11")
-    root.option_add("*TLabel.Font", "Segoe UI 11")
-    root.option_add("*TButton.Font", "Segoe UI 11")
-    root.option_add("*TCombobox*Listbox.Font", "Segoe UI 11")
-    root.option_add("*Entry.Font", "Segoe UI 11")
+    root.option_add("*Font", "{Segoe UI} 11")
+    root.option_add("*TLabel.Font", "{Segoe UI} 11")
+    root.option_add("*TButton.Font", "{Segoe UI} 11")
+    root.option_add("*TCombobox*Listbox.Font", "{Segoe UI} 11")
+    root.option_add("*Entry.Font", "{Segoe UI} 11")
     root.option_add("*Foreground", PALETTE["text"])
     root.option_add("*Background", PALETTE["background"])
     root.option_add("*Label.Foreground", PALETTE["text"])
@@ -99,7 +99,8 @@ def init_theme(root: tk.Misc) -> None:
         "OctoAccent.TButton",
         background=[
             ("active", PALETTE["accent_hover"]),
-            ("pressed", PALETTE["accent_active"])
+            ("pressed", PALETTE["accent_active"]),
+            ("disabled", PALETTE["disabled_bg"]),
         ],
         foreground=[("disabled", PALETTE["disabled_fg"])],
         relief=[("pressed", "sunken")],
@@ -131,7 +132,11 @@ def init_theme(root: tk.Misc) -> None:
     )
     style.map(
         "OctoGhost.TButton",
-        background=[("active", PALETTE["neutral_hover"]), ("pressed", PALETTE["neutral_active"])],
+        background=[
+            ("active", PALETTE["neutral_hover"]),
+            ("pressed", PALETTE["neutral_active"]),
+            ("disabled", PALETTE["disabled_bg"]),
+        ],
         foreground=[("disabled", PALETTE["disabled_fg"])],
     )
 
