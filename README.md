@@ -42,6 +42,7 @@ Le dossier `test/` contient un exemple de « trou » et des photos de pièces ut
 - `models.py` – détection des pièces, matching et moteur de résolution
 - `widgets.py` – widgets personnalisés (canvas interactif, panneaux d’images, barre de stats)
 - `image_utils.py` – conversions OpenCV ↔ PIL ↔ interface graphique, mise en cache, visualisations
+- `assets/` – ressources (icônes) et script `generate_icon.py`
 - `test/` – images d’exemple
 
 ## Fonctionnalités actuelles

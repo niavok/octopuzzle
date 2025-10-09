@@ -93,19 +93,25 @@ class OctopuzzleApp(tk.Tk):
 
     def _configure_icon(self):
         """Set custom window/taskbar icon when available."""
-        try:
-            if ICON_PNG_PATH.exists():
-                self.icon_image = tk.PhotoImage(file=str(ICON_PNG_PATH))
-                self.iconphoto(True, self.icon_image)
-        except Exception as exc:
-            print(f"[WARN] Unable to set PhotoImage icon: {exc}")
+        icon_set = False
 
-        try:
-            if ICON_ICO_PATH.exists():
-                self.iconbitmap(default=str(ICON_ICO_PATH))
-        except Exception:
-            # Some platforms (e.g., macOS/Linux) don't support iconbitmap with ICO files.
-            pass
+        if ICON_ICO_PATH.exists():
+            try:
+                self.iconbitmap(str(ICON_ICO_PATH))
+                icon_set = True
+            except Exception as exc:
+                print(f"[WARN] Unable to set iconbitmap icon: {exc}")
+
+        if ICON_PNG_PATH.exists():
+            try:
+                self.icon_image = tk.PhotoImage(file=str(ICON_PNG_PATH))
+                self.tk.call("wm", "iconphoto", self._w, self.icon_image)
+                icon_set = True
+            except Exception as exc:
+                print(f"[WARN] Unable to set PhotoImage icon: {exc}")
+
+        if not icon_set:
+            print("[INFO] Octopuzzle icon not applied (assets missing or unsupported platform).")
 
 
 class Step1Frame(tk.Frame):
