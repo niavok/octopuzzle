@@ -1,6 +1,6 @@
 """
-Image utilities for Tkinter GUI
-Handles conversions between OpenCV, PIL, and Tkinter formats
+Image utilities for Octopuzzle
+Handles conversions between OpenCV, PIL, and Tk-compatible formats
 """
 
 import cv2
@@ -53,7 +53,7 @@ image_cache = ImageCache()
 
 def cv2_to_photoimage(cv_img: np.ndarray, max_width: int = None, max_height: int = None) -> Tuple[ImageTk.PhotoImage, int, int]:
     """
-    Convert OpenCV image to Tkinter PhotoImage
+    Convert OpenCV image to a Tk PhotoImage
     Returns: (PhotoImage, display_width, display_height)
     """
     if cv_img is None:
@@ -112,23 +112,24 @@ def draw_roi_overlay(cv_img: np.ndarray, roi: Tuple[int, int, int, int]) -> np.n
     # Blend
     cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
 
-    # Draw ROI border
-    cv2.rectangle(img, (x, y), (x+w, y+h), (255, 0, 255), 3)
+    # Draw ROI border in Octopuzzle accent color (BGR)
+    accent_bgr = (241, 102, 99)
+    cv2.rectangle(img, (x, y), (x+w, y+h), accent_bgr, 3)
 
     # Draw corner markers
     marker_size = 10
     # Top-left
-    cv2.line(img, (x, y), (x + marker_size, y), (255, 0, 255), 4)
-    cv2.line(img, (x, y), (x, y + marker_size), (255, 0, 255), 4)
+    cv2.line(img, (x, y), (x + marker_size, y), accent_bgr, 4)
+    cv2.line(img, (x, y), (x, y + marker_size), accent_bgr, 4)
     # Top-right
-    cv2.line(img, (x + w, y), (x + w - marker_size, y), (255, 0, 255), 4)
-    cv2.line(img, (x + w, y), (x + w, y + marker_size), (255, 0, 255), 4)
+    cv2.line(img, (x + w, y), (x + w - marker_size, y), accent_bgr, 4)
+    cv2.line(img, (x + w, y), (x + w, y + marker_size), accent_bgr, 4)
     # Bottom-left
-    cv2.line(img, (x, y + h), (x + marker_size, y + h), (255, 0, 255), 4)
-    cv2.line(img, (x, y + h), (x, y + h - marker_size), (255, 0, 255), 4)
+    cv2.line(img, (x, y + h), (x + marker_size, y + h), accent_bgr, 4)
+    cv2.line(img, (x, y + h), (x, y + h - marker_size), accent_bgr, 4)
     # Bottom-right
-    cv2.line(img, (x + w, y + h), (x + w - marker_size, y + h), (255, 0, 255), 4)
-    cv2.line(img, (x + w, y + h), (x + w, y + h - marker_size), (255, 0, 255), 4)
+    cv2.line(img, (x + w, y + h), (x + w - marker_size, y + h), accent_bgr, 4)
+    cv2.line(img, (x + w, y + h), (x + w, y + h - marker_size), accent_bgr, 4)
 
     return img
 

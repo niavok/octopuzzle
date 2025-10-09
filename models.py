@@ -1,5 +1,5 @@
 """
-Puzzle Solver - Data Models and Business Logic
+Octopuzzle - Data Models and Business Logic
 Contains: CalibrationData, PuzzlePiece, Detector, Matcher, Solver
 """
 
