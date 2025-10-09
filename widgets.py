@@ -229,12 +229,15 @@ class CalibrationCanvas(tk.Canvas):
             **kwargs,
         )
 
-        self.image = None  # Current cv2 image
+        self.image = None  # Base cv2 image used for coordinate conversions
+        self.base_image = None  # Stored original image for overlays
         self.photo: Optional[ImageTk.PhotoImage] = None
         self.image_id = None  # Canvas image ID
 
         self.mode = "none"  # 'roi', 'background', or 'none'
         self.roi: Optional[Tuple[int, int, int, int]] = None
+        self.outer_roi: Optional[Tuple[int, int, int, int]] = None
+        self.inner_roi: Optional[Tuple[int, int, int, int]] = None
         self.background_sample: Optional[Tuple[int, int, int]] = None
 
         self.drag_start: Optional[Tuple[int, int]] = None
@@ -242,6 +245,8 @@ class CalibrationCanvas(tk.Canvas):
 
         # Callbacks
         self.on_roi_selected: Optional[Callable[[Tuple[int, int, int, int]], None]] = None
+        self.on_outer_selected: Optional[Callable[[Tuple[int, int, int, int]], None]] = None
+        self.on_inner_selected: Optional[Callable[[Tuple[int, int, int, int]], None]] = None
         self.on_background_selected: Optional[Callable[[Tuple[int, int, int]], None]] = None
 
         # Bind mouse events
@@ -254,6 +259,9 @@ class CalibrationCanvas(tk.Canvas):
         self.mode = mode
         if mode == "none":
             self.drag_start = None
+            self.configure(cursor="arrow")
+        else:
+            self.configure(cursor="crosshair")
 
     def load_image(self, cv_img):
         """Load and display image."""
@@ -261,6 +269,14 @@ class CalibrationCanvas(tk.Canvas):
             return
 
         self.image = cv_img
+        self.base_image = cv_img
+        self.roi = None
+        self.outer_roi = None
+        self.inner_roi = None
+        self._display_image(cv_img)
+
+    def show_image(self, cv_img):
+        """Display provided image without altering base reference."""
         self._display_image(cv_img)
 
     def show_debug_image(self, debug_img):
@@ -269,16 +285,20 @@ class CalibrationCanvas(tk.Canvas):
 
     def draw_roi_overlay(self):
         """Draw ROI overlay on current image."""
-        if self.image is None or self.roi is None:
+        if self.base_image is None:
             return
 
-        img_with_overlay = draw_roi_overlay(self.image, self.roi)
+        img_with_overlay = draw_roi_overlay(self.base_image, self.roi or self.outer_roi, self.inner_roi)
         self._display_image(img_with_overlay)
 
     def clear(self):
         """Clear canvas."""
         self.delete("all")
         self.image = None
+        self.base_image = None
+        self.roi = None
+        self.outer_roi = None
+        self.inner_roi = None
         self.photo = None
         self.image_id = None
 
@@ -322,7 +342,12 @@ class CalibrationCanvas(tk.Canvas):
         x1, y1 = self.drag_start
         x2, y2 = event.x, event.y
 
-        color = PALETTE["accent"] if self.mode == "roi" else PALETTE["warning"]
+        if self.mode in {"outer", "roi"}:
+            color = PALETTE["accent"]
+        elif self.mode == "inner":
+            color = "#63d6ff"
+        else:
+            color = PALETTE["warning"]
         self.drag_rect_id = self.create_rectangle(
             x1,
             y1,
@@ -385,6 +410,18 @@ class CalibrationCanvas(tk.Canvas):
             self.draw_roi_overlay()
             if self.on_roi_selected:
                 self.on_roi_selected(self.roi)
+
+        elif self.mode == "outer":
+            self.outer_roi = (x, y, w, h)
+            self.draw_roi_overlay()
+            if self.on_outer_selected:
+                self.on_outer_selected(self.outer_roi)
+
+        elif self.mode == "inner":
+            self.inner_roi = (x, y, w, h)
+            self.draw_roi_overlay()
+            if self.on_inner_selected:
+                self.on_inner_selected(self.inner_roi)
 
         elif self.mode == "background" and self.image is not None:
             roi_img = self.image[y : y + h, x : x + w]
@@ -530,13 +567,23 @@ class CalibrationStatusDisplay(tk.Frame):
 
         self.roi_status = tk.Label(
             self,
-            text="○ Zone de remplissage : non définie",
+            text="○ Bord extérieur : non défini",
             bg=PALETTE["panel"],
             fg=PALETTE["muted"],
             font=("Segoe UI", 10),
             anchor="w",
         )
         self.roi_status.pack(fill=tk.X, padx=10, pady=(8, 4))
+
+        self.inner_status = tk.Label(
+            self,
+            text="○ Zone interne : non définie",
+            bg=PALETTE["panel"],
+            fg=PALETTE["muted"],
+            font=("Segoe UI", 10),
+            anchor="w",
+        )
+        self.inner_status.pack(fill=tk.X, padx=10, pady=(0, 4))
 
         self.bg_status = tk.Label(
             self,
@@ -548,19 +595,37 @@ class CalibrationStatusDisplay(tk.Frame):
         )
         self.bg_status.pack(fill=tk.X, padx=10, pady=(0, 8))
 
-    def update_roi(self, roi: Optional[Tuple[int, int, int, int]]):
-        """Update ROI status."""
+    def update_outer_roi(self, roi: Optional[Tuple[int, int, int, int]]):
+        """Update outer ROI status."""
         if roi:
             _, _, w, h = roi
             self.roi_status.config(
-                text=f"✓ Zone de remplissage : {w}×{h}px",
+                text=f"✓ Bord extérieur : {w}×{h}px",
                 fg=PALETTE["accent"],
             )
         else:
             self.roi_status.config(
-                text="○ Zone de remplissage : non définie",
+                text="○ Bord extérieur : non défini",
                 fg=PALETTE["muted"],
             )
+
+    def update_inner_roi(self, roi: Optional[Tuple[int, int, int, int]]):
+        """Update inner ROI status."""
+        if roi:
+            _, _, w, h = roi
+            self.inner_status.config(
+                text=f"✓ Zone interne : {w}×{h}px",
+                fg="#63d6ff",
+            )
+        else:
+            self.inner_status.config(
+                text="○ Zone interne : non définie",
+                fg=PALETTE["muted"],
+            )
+
+    def update_roi(self, roi: Optional[Tuple[int, int, int, int]]):
+        """Backward compatibility for single ROI workflows."""
+        self.update_outer_roi(roi)
 
     def update_background(self, bg_color: Optional[Tuple[int, int, int]]):
         """Update background sample status."""

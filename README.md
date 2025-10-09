@@ -48,6 +48,7 @@ Le dossier `test/` contient un exemple de « trou » et des photos de pièces ut
 ## Fonctionnalités actuelles
 
 - Charge les photos du trou et des pièces, avec calibration optionnelle (ROI, fond, surface min/max)
+- Analyse en direct de la zone à combler (double ROI, estimation de la grille manquante, mode debug multi-couches)
 - Détection de pièces via OpenCV (seuillage adaptatif + morphologie) et classification heuristique des tabs
 - Interface unifiée native avec thème moderne, boutons lisibles et panneaux de comparaison
 - Système de suggestions basé sur la compatibilité des tabs et sur la taille normalisée des pièces

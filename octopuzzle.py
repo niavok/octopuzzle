@@ -9,7 +9,14 @@ import cv2
 from typing import List, Optional
 from pathlib import Path
 
-from models import CalibrationData, PuzzlePiece, PuzzlePieceDetector, PuzzleSolver
+from models import (
+    CalibrationData,
+    HoleCalibration,
+    PuzzlePiece,
+    PuzzlePieceDetector,
+    PuzzleSolver,
+    HoleAnalyzer,
+)
 from widgets import (
     CalibrationCanvas,
     ImagePanel,
@@ -20,7 +27,7 @@ from widgets import (
     BUTTON_STYLES,
     CHECKBUTTON_STYLE,
 )
-from image_utils import image_cache, extract_piece_image
+from image_utils import image_cache, extract_piece_image, draw_roi_overlay, draw_grid_overlay
 
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PNG_PATH = ASSETS_DIR / "octopuzzle_icon.png"
@@ -44,8 +51,9 @@ class OctopuzzleApp(tk.Tk):
         self._configure_icon()
 
         # State
-        self.puzzle_calibration = CalibrationData()
+        self.puzzle_calibration = HoleCalibration()
         self.pieces_calibration = CalibrationData()
+        self.hole_analyzer = HoleAnalyzer()
         self.puzzle_image_path = None
         self.pieces_image_paths = []
         self.puzzle_pieces = []
@@ -115,24 +123,65 @@ class OctopuzzleApp(tk.Tk):
 
 
 class Step1Frame(tk.Frame):
-    """Step 1: Load and calibrate puzzle state image."""
+    """Step 1: Load and analyse the puzzle hole."""
+
+    DEBUG_LAYERS_ORDER = [
+        "Contours (bord)",
+        "Edges anneau",
+        "Contours internes",
+        "Masque ombre",
+        "Grille estimée",
+    ]
 
     def __init__(self, parent, app):
         super().__init__(parent, bg=PALETTE["background"])
         self.app = app
 
-        header = ttk.Label(self, text="Étape 1 · Zone à compléter", style="OctoTitle.TLabel")
-        header.pack(pady=(20, 8))
+        self.base_image = None
+        self.analysis = {}
+        self.analysis_display = None
+
+        header_frame = tk.Frame(self, bg=PALETTE["background"])
+        header_frame.pack(fill=tk.X, pady=(20, 8), padx=24)
+
+        ttk.Label(header_frame, text="Étape 1 · Zone à compléter", style="OctoTitle.TLabel").pack(
+            side=tk.LEFT
+        )
+
+        debug_frame = tk.Frame(header_frame, bg=PALETTE["background"])
+        debug_frame.pack(side=tk.RIGHT)
+        self.debug_enabled = tk.BooleanVar(value=False)
+        self.debug_toggle = ttk.Checkbutton(
+            debug_frame,
+            text="Mode debug",
+            variable=self.debug_enabled,
+            command=self.on_debug_toggle,
+            style=CHECKBUTTON_STYLE,
+        )
+        self.debug_toggle.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.debug_layer_var = tk.StringVar(value="Contours (bord)")
+        self.debug_layer_combo = ttk.Combobox(
+            debug_frame,
+            textvariable=self.debug_layer_var,
+            state="readonly",
+            width=22,
+        )
+        self.debug_layer_combo.bind("<<ComboboxSelected>>", lambda _evt: self.render_display())
 
         subheader = tk.Label(
             self,
-            text="Chargez la photo du trou à combler, puis ajustez les paramètres si nécessaire.",
+            text=(
+                "Importez la photo du trou à combler. Sélectionnez ensuite la bordure complète et "
+                "une zone intérieure homogène pour permettre au détecteur de reconstituer la grille manquante."
+            ),
             bg=PALETTE["background"],
             fg=PALETTE["muted"],
             font=("Segoe UI", 11),
-            wraplength=880,
+            wraplength=900,
+            justify=tk.LEFT,
         )
-        subheader.pack(pady=(0, 18))
+        subheader.pack(pady=(0, 18), padx=24)
 
         content = tk.Frame(self, bg=PALETTE["background"])
         content.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 20))
@@ -142,7 +191,7 @@ class Step1Frame(tk.Frame):
             bg=PALETTE["panel"],
             highlightbackground=PALETTE["border"],
             highlightthickness=1,
-            width=330,
+            width=340,
         )
         controls.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
         controls.pack_propagate(False)
@@ -158,42 +207,32 @@ class Step1Frame(tk.Frame):
         self.btn_load = self.app.make_button(controls, "📷 Importer une image", self.load_image)
         self.btn_load.pack(fill=tk.X, padx=20, pady=(0, 12))
 
-        self.debug_var = tk.BooleanVar()
-        self.debug_toggle = ttk.Checkbutton(
+        self.btn_select_outer = self.app.make_button(
             controls,
-            text="Afficher la détection en direct",
-            variable=self.debug_var,
-            command=self.toggle_debug,
-            style=CHECKBUTTON_STYLE,
-        )
-        self.debug_toggle.pack(anchor=tk.W, padx=20, pady=(0, 14))
-
-        self.btn_select_roi = self.app.make_button(
-            controls,
-            "1. Définir la zone à remplir",
-            self.select_roi,
+            "1. Définir la bordure du trou",
+            lambda: self.activate_mode("outer"),
             variant="secondary",
         )
-        self.btn_select_roi.pack(fill=tk.X, padx=20, pady=4)
-        self.btn_select_roi.state(["disabled"])
+        self.btn_select_outer.pack(fill=tk.X, padx=20, pady=4)
+        self.btn_select_outer.state(["disabled"])
 
-        self.btn_select_bg = self.app.make_button(
+        self.btn_select_inner = self.app.make_button(
             controls,
-            "2. Échantillonner le fond",
-            self.select_background,
+            "2. Définir la zone interne",
+            lambda: self.activate_mode("inner"),
             variant="secondary",
         )
-        self.btn_select_bg.pack(fill=tk.X, padx=20, pady=4)
-        self.btn_select_bg.state(["disabled"])
+        self.btn_select_inner.pack(fill=tk.X, padx=20, pady=4)
+        self.btn_select_inner.state(["disabled"])
 
-        self.btn_preview = self.app.make_button(
+        self.btn_refresh = self.app.make_button(
             controls,
-            "Prévisualiser la détection",
-            self.preview_detection,
+            "Recalculer l'analyse",
+            self.run_analysis,
             variant="ghost",
         )
-        self.btn_preview.pack(fill=tk.X, padx=20, pady=(10, 16))
-        self.btn_preview.state(["disabled"])
+        self.btn_refresh.pack(fill=tk.X, padx=20, pady=(6, 10))
+        self.btn_refresh.state(["disabled"])
 
         tk.Label(
             controls,
@@ -238,16 +277,41 @@ class Step1Frame(tk.Frame):
         self.status_display = CalibrationStatusDisplay(controls)
         self.status_display.pack(fill=tk.X, padx=18, pady=(12, 8))
 
-        self.status_label = tk.Label(
+        self.summary_label = tk.Label(
             controls,
-            text="Importez la photo du trou pour démarrer.",
+            text="Analyse en attente.",
             bg=PALETTE["panel"],
             fg=PALETTE["muted"],
             font=("Segoe UI", 10),
             wraplength=260,
             justify=tk.LEFT,
         )
-        self.status_label.pack(fill=tk.X, padx=20, pady=(4, 18))
+        self.summary_label.pack(fill=tk.X, padx=20, pady=(4, 8))
+
+        self.grid_label = tk.Label(
+            controls,
+            text="",
+            bg=PALETTE["panel"],
+            fg=PALETTE["muted"],
+            font=("Segoe UI", 10),
+            wraplength=260,
+            justify=tk.LEFT,
+        )
+        self.grid_label.pack(fill=tk.X, padx=20, pady=(0, 16))
+
+        self.pieces_label = tk.Label(
+            controls,
+            text="Pièces détectées : —",
+            bg=PALETTE["panel"],
+            fg=PALETTE["muted"],
+            font=("Segoe UI", 10),
+            anchor="w",
+            wraplength=260,
+            justify=tk.LEFT,
+        )
+        self.pieces_label.pack(fill=tk.X, padx=20, pady=(0, 12))
+
+        self.detected_pieces = None
 
         self.btn_next = self.app.make_button(
             controls,
@@ -262,16 +326,23 @@ class Step1Frame(tk.Frame):
 
         self.canvas = CalibrationCanvas(canvas_frame, width=820, height=640)
         self.canvas.pack(fill=tk.BOTH, expand=True)
-        self.canvas.on_roi_selected = self.on_roi_selected
-        self.canvas.on_background_selected = self.on_background_selected
+        self.canvas.on_outer_selected = self.on_outer_selected
+        self.canvas.on_inner_selected = self.on_inner_selected
+
+    def activate_mode(self, mode: str):
+        if self.base_image is None:
+            return
+        self.canvas.set_mode(mode)
+        if mode == "outer":
+            self.summary_label.config(text="Glissez pour englober tout le trou (bord compris).")
+        elif mode == "inner":
+            self.summary_label.config(text="Glissez pour sélectionner une zone interne sans bord.")
 
     def load_image(self):
-        """Load puzzle state image."""
         path = filedialog.askopenfilename(
             title="Sélectionner la zone à compléter",
             filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp")],
         )
-
         if not path:
             return
 
@@ -281,110 +352,189 @@ class Step1Frame(tk.Frame):
             return
 
         self.app.puzzle_image_path = path
+        self.base_image = img
         self.canvas.load_image(img)
-        self.canvas.roi = None
+        self.canvas.outer_roi = None
+        self.canvas.inner_roi = None
         self.canvas.background_sample = None
+        self.canvas.set_mode("none")
 
-        self.app.puzzle_calibration.roi = None
-        self.app.puzzle_calibration.background_sample = None
+        calib = self.app.puzzle_calibration
+        calib.outer_roi = None
+        calib.inner_roi = None
+        calib.background_sample = None
 
-        self.status_display.update_roi(None)
+        self.status_display.update_outer_roi(None)
+        self.status_display.update_inner_roi(None)
         self.status_display.update_background(None)
-        self.status_label.config(
-            text="Zone chargée. Sélectionnez la zone à remplir puis, si besoin, échantillonnez le fond."
-        )
 
-        self.btn_select_roi.state(["!disabled"])
-        self.btn_select_bg.state(["!disabled"])
-        self.btn_preview.state(["!disabled"])
-        self.btn_next.state(["!disabled"])
-        self.debug_var.set(False)
+        self.summary_label.config(text="Sélectionnez d'abord la bordure complète du trou.")
+        self.grid_label.config(text="")
+        self.pieces_label.config(text="Pièces détectées : —", fg=PALETTE["muted"])
+        self.detected_pieces = None
+        self.analysis = {}
+        self.analysis_display = None
+        self.debug_enabled.set(False)
+        self.update_debug_controls()
+
+        self.btn_select_outer.state(["!disabled"])
+        self.btn_select_inner.state(["disabled"])
+        self.btn_refresh.state(["disabled"])
+        self.btn_next.state(["disabled"])
+
+    def on_outer_selected(self, roi):
+        self.app.puzzle_calibration.outer_roi = roi
+        self.status_display.update_outer_roi(roi)
+        self.summary_label.config(text="Bordure détectée. Sélectionnez maintenant la zone interne.")
+        self.btn_select_inner.state(["!disabled"])
+        self.btn_refresh.state(["!disabled"])
         self.canvas.set_mode("none")
+        self.run_analysis()
 
-    def select_roi(self):
-        """Activate ROI selection mode."""
-        if not self.app.puzzle_image_path:
-            return
-        self.canvas.set_mode("roi")
-        self.status_label.config(text="Glissez sur l'image pour délimiter la zone à remplir.")
-
-    def select_background(self):
-        """Activate background selection mode."""
-        if not self.app.puzzle_image_path:
-            return
-        self.canvas.set_mode("background")
-        self.status_label.config(text="Glissez sur l'image pour échantillonner le fond.")
-
-    def on_roi_selected(self, roi):
-        """Handle ROI selection."""
-        self.app.puzzle_calibration.roi = roi
-        self.status_display.update_roi(roi)
-        self.status_label.config(text=f"Zone définie : {roi[2]} × {roi[3]} px.")
+    def on_inner_selected(self, roi):
+        self.app.puzzle_calibration.inner_roi = roi
+        self.status_display.update_inner_roi(roi)
+        self.summary_label.config(text="Zone interne définie. Analyse en cours...")
         self.canvas.set_mode("none")
-        self.check_ready()
+        self.run_analysis()
 
     def on_background_selected(self, bg_color):
-        """Handle background selection."""
-        self.app.puzzle_calibration.background_sample = bg_color
-        self.status_display.update_background(bg_color)
-        r, g, b = int(bg_color[2]), int(bg_color[1]), int(bg_color[0])
-        self.status_label.config(text=f"Fond échantillonné : RGB({r}, {g}, {b}).")
-        self.canvas.set_mode("none")
-        self.check_ready()
+        # Background sampling is now derived automatically from the zone interne.
+        pass
 
-    def toggle_debug(self):
-        """Toggle debug view."""
-        if self.debug_var.get():
-            self.preview_detection()
+    def on_debug_toggle(self):
+        self.update_debug_controls()
+        self.render_display()
+
+    def update_debug_controls(self):
+        if self.debug_enabled.get() and self.analysis.get("debug_layers"):
+            layers = list(self.analysis["debug_layers"].keys())
+            ordered = [layer for layer in self.DEBUG_LAYERS_ORDER if layer in layers]
+            for layer in layers:
+                if layer not in ordered:
+                    ordered.append(layer)
+            self.debug_layer_combo["values"] = ordered
+            if self.debug_layer_var.get() not in ordered and ordered:
+                self.debug_layer_var.set(ordered[0])
+            if not self.debug_layer_combo.winfo_ismapped():
+                self.debug_layer_combo.pack(side=tk.LEFT)
         else:
-            if self.app.puzzle_image_path:
-                img = cv2.imread(self.app.puzzle_image_path)
-                if img is not None:
-                    self.canvas.load_image(img)
-                    if self.canvas.roi:
-                        self.canvas.draw_roi_overlay()
+            if self.debug_layer_combo.winfo_ismapped():
+                self.debug_layer_combo.pack_forget()
 
-    def preview_detection(self):
-        """Preview piece detection with debug overlay."""
-        if not self.app.puzzle_image_path:
+    def run_analysis(self):
+        if self.base_image is None:
             return
 
-        self.app.puzzle_calibration.min_area = self.min_area_var.get()
-        self.app.puzzle_calibration.max_area = self.max_area_var.get()
+        outer = self.app.puzzle_calibration.outer_roi
+        inner = self.app.puzzle_calibration.inner_roi
 
-        detector = PuzzlePieceDetector(self.app.puzzle_calibration)
-        pieces, debug_img = detector.detect_with_debug(self.app.puzzle_image_path)
-
-        if debug_img is not None:
-            self.canvas.show_debug_image(debug_img)
-            self.status_label.config(text=f"{len(pieces)} pièces détectées dans la zone.")
-
-    def check_ready(self):
-        """Check if ready to proceed to next step."""
-        if self.app.puzzle_image_path:
-            self.btn_next.state(["!disabled"])
+        if outer and inner:
+            self.btn_refresh.state(["!disabled"])
         else:
+            self.btn_refresh.state(["disabled"])
+
+        self.analysis_display = draw_roi_overlay(self.base_image, outer, inner)
+        self.analysis = {}
+
+        if outer and inner:
+            analysis = self.app.hole_analyzer.analyze(self.base_image, outer, inner)
+            self.analysis = analysis
+            grid_text = ""
+            if analysis.get("status") == "ok" and analysis.get("grid_cells"):
+                grid_overlay = draw_grid_overlay(
+                    self.base_image,
+                    analysis["grid_cells"],
+                    analysis["grid_lines"]["vertical"],
+                    analysis["grid_lines"]["horizontal"],
+                )
+                self.analysis_display = draw_roi_overlay(grid_overlay, outer, inner)
+
+                cols = len(analysis["grid_lines"]["vertical"]) - 1
+                rows = len(analysis["grid_lines"]["horizontal"]) - 1
+                self.summary_label.config(
+                    text=f"Grille estimée : {cols} × {rows} ({analysis['missing_count']} emplacements)."
+                )
+                grid_text = "Contours et grille recalculés."
+                self.btn_next.state(["!disabled"])
+            else:
+                self.summary_label.config(
+                    text="Analyse effectuée mais aucune grille claire n'a été trouvée. Ajustez les zones."
+                )
+                grid_text = "Essayez d'élargir la zone externe ou de repositionner la zone interne."
+                self.btn_next.state(["disabled"])
+
+            color_sample = analysis.get("mean_color")
+            if color_sample:
+                self.app.puzzle_calibration.background_sample = color_sample
+                self.canvas.background_sample = color_sample
+                self.status_display.update_background(color_sample)
+                r, g, b = color_sample[2], color_sample[1], color_sample[0]
+                if grid_text:
+                    grid_text += "\n"
+                grid_text += f"Couleur moyenne : RGB({r}, {g}, {b})."
+
+            self.grid_label.config(text=grid_text)
+
+            self.update_debug_controls()
+        else:
+            self.summary_label.config(
+                text="Sélectionnez les deux zones (bord extérieur puis zone interne) pour lancer l'analyse."
+            )
+            self.grid_label.config(text="")
             self.btn_next.state(["disabled"])
 
+        if self.detected_pieces is not None:
+            self.pieces_label.config(
+                text=f"Pièces détectées à l'intérieur : {self.detected_pieces}",
+                fg=PALETTE["accent"] if self.detected_pieces else PALETTE["muted"],
+            )
+
+        self.render_display()
+
+    def render_display(self):
+        if self.base_image is None:
+            return
+
+        if self.debug_enabled.get() and self.analysis.get("debug_layers"):
+            layers = self.analysis["debug_layers"]
+            layer_name = self.debug_layer_var.get()
+            if layer_name not in layers and layers:
+                layer_name = next(iter(layers))
+                self.debug_layer_var.set(layer_name)
+            if layer_name in layers:
+                self.canvas.show_image(layers[layer_name])
+                return
+
+        img = self.analysis_display if self.analysis_display is not None else draw_roi_overlay(
+            self.base_image,
+            self.app.puzzle_calibration.outer_roi,
+            self.app.puzzle_calibration.inner_roi,
+        )
+        self.canvas.show_image(img)
+
     def next_step(self):
-        """Load pieces and proceed to step 2."""
         if not self.app.puzzle_image_path:
             return
 
-        self.app.puzzle_calibration.min_area = self.min_area_var.get()
-        self.app.puzzle_calibration.max_area = self.max_area_var.get()
+        calib = CalibrationData(
+            roi=self.app.puzzle_calibration.inner_roi,
+            background_sample=self.app.puzzle_calibration.background_sample,
+            min_area=self.min_area_var.get(),
+            max_area=self.max_area_var.get(),
+        )
 
-        detector = PuzzlePieceDetector(self.app.puzzle_calibration)
+        detector = PuzzlePieceDetector(calib)
         self.app.puzzle_pieces = detector.detect_pieces(
             self.app.puzzle_image_path, "puzzle_state"
         )
 
-        self.status_label.config(
-            text=f"{len(self.app.puzzle_pieces)} morceaux identifiés dans le trou."
+        self.detected_pieces = len(self.app.puzzle_pieces)
+        self.pieces_label.config(
+            text=f"Pièces détectées à l'intérieur : {self.detected_pieces}",
+            fg=PALETTE["accent"] if self.detected_pieces else PALETTE["warning"],
         )
         self.app.show_step(2)
-
-
 class Step2Frame(tk.Frame):
     """Step 2: Load and calibrate available pieces images."""
 

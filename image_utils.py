@@ -6,7 +6,7 @@ Handles conversions between OpenCV, PIL, and Tk-compatible formats
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List, Dict
 import tempfile
 import os
 
@@ -88,48 +88,50 @@ def cv2_to_photoimage(cv_img: np.ndarray, max_width: int = None, max_height: int
     return photo, display_width, display_height
 
 
-def draw_roi_overlay(cv_img: np.ndarray, roi: Tuple[int, int, int, int]) -> np.ndarray:
+def _apply_roi_overlay(img: np.ndarray, roi: Tuple[int, int, int, int],
+                       color: Tuple[int, int, int], thickness: int = 4) -> np.ndarray:
+    """Utility to draw a single ROI overlay with provided color and thickness."""
+    x, y, w, h = roi
+
+    overlay = img.copy()
+
+    overlay[:y, :] = overlay[:y, :] * 0.55
+    overlay[y:y+h, :x] = overlay[y:y+h, :x] * 0.55
+    overlay[y:y+h, x+w:] = overlay[y:y+h, x+w:] * 0.55
+    overlay[y+h:, :] = overlay[y+h:, :] * 0.55
+
+    cv2.addWeighted(overlay, 0.65, img, 0.35, 0, img)
+
+    cv2.rectangle(img, (x, y), (x+w, y+h), color, thickness)
+
+    marker_size = 12
+    cv2.line(img, (x, y), (x + marker_size, y), color, thickness)
+    cv2.line(img, (x, y), (x, y + marker_size), color, thickness)
+    cv2.line(img, (x + w, y), (x + w - marker_size, y), color, thickness)
+    cv2.line(img, (x + w, y), (x + w, y + marker_size), color, thickness)
+    cv2.line(img, (x, y + h), (x + marker_size, y + h), color, thickness)
+    cv2.line(img, (x, y + h), (x, y + h - marker_size), color, thickness)
+    cv2.line(img, (x + w, y + h), (x + w - marker_size, y + h), color, thickness)
+    cv2.line(img, (x + w, y + h), (x + w, y + h - marker_size), color, thickness)
+
+    return img
+
+
+def draw_roi_overlay(cv_img: np.ndarray, roi: Optional[Tuple[int, int, int, int]],
+                     secondary_roi: Optional[Tuple[int, int, int, int]] = None) -> np.ndarray:
     """
-    Draw ROI overlay on image (darkens outside area, highlights ROI border)
-    Returns: new image with overlay
+    Draw one or two ROI overlays on the image.
+    The primary ROI uses the accent color, the secondary ROI uses cyan.
     """
-    if cv_img is None or roi is None:
+    if cv_img is None:
         return cv_img
 
     img = cv_img.copy()
-    x, y, w, h = roi
-    height, width = img.shape[:2]
+    if roi:
+        img = _apply_roi_overlay(img, roi, (99, 102, 241), thickness=5)
 
-    # Create overlay mask
-    overlay = img.copy()
-
-    # Darken outside ROI
-    overlay[:y, :] = overlay[:y, :] * 0.5  # Top
-    overlay[y:y+h, :x] = overlay[y:y+h, :x] * 0.5  # Left
-    overlay[y:y+h, x+w:] = overlay[y:y+h, x+w:] * 0.5  # Right
-    overlay[y+h:, :] = overlay[y+h:, :] * 0.5  # Bottom
-
-    # Blend
-    cv2.addWeighted(overlay, 0.7, img, 0.3, 0, img)
-
-    # Draw ROI border in Octopuzzle accent color (BGR)
-    accent_bgr = (241, 102, 99)
-    cv2.rectangle(img, (x, y), (x+w, y+h), accent_bgr, 3)
-
-    # Draw corner markers
-    marker_size = 10
-    # Top-left
-    cv2.line(img, (x, y), (x + marker_size, y), accent_bgr, 4)
-    cv2.line(img, (x, y), (x, y + marker_size), accent_bgr, 4)
-    # Top-right
-    cv2.line(img, (x + w, y), (x + w - marker_size, y), accent_bgr, 4)
-    cv2.line(img, (x + w, y), (x + w, y + marker_size), accent_bgr, 4)
-    # Bottom-left
-    cv2.line(img, (x, y + h), (x + marker_size, y + h), accent_bgr, 4)
-    cv2.line(img, (x, y + h), (x, y + h - marker_size), accent_bgr, 4)
-    # Bottom-right
-    cv2.line(img, (x + w, y + h), (x + w - marker_size, y + h), accent_bgr, 4)
-    cv2.line(img, (x + w, y + h), (x + w, y + h - marker_size), accent_bgr, 4)
+    if secondary_roi:
+        img = _apply_roi_overlay(img, secondary_roi, (99, 214, 255), thickness=4)
 
     return img
 
@@ -187,6 +189,28 @@ def draw_piece_highlight(cv_img: np.ndarray, bbox: Tuple[int, int, int, int],
         # Text
         cv2.putText(img, label, (x+5, y-8),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    return img
+
+
+def draw_grid_overlay(cv_img: np.ndarray, grid_cells: List[Tuple[int, int, int, int]],
+                      vertical_lines: List[int], horizontal_lines: List[int],
+                      color: Tuple[int, int, int] = (99, 214, 255)) -> np.ndarray:
+    """
+    Draw an estimated grid overlay on the provided image.
+    """
+    if cv_img is None:
+        return cv_img
+
+    img = cv_img.copy()
+    for x in vertical_lines:
+        cv2.line(img, (x, 0), (x, img.shape[0]), color, 2, lineType=cv2.LINE_AA)
+    for y in horizontal_lines:
+        cv2.line(img, (0, y), (img.shape[1], y), color, 2, lineType=cv2.LINE_AA)
+
+    for idx, (x, y, w, h) in enumerate(grid_cells, start=1):
+        cv2.rectangle(img, (x, y), (x + w, y + h), color, 2, lineType=cv2.LINE_AA)
+        cv2.putText(img, str(idx), (x + 8, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv2.LINE_AA)
 
     return img
 

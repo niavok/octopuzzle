@@ -5,8 +5,9 @@ Contains: CalibrationData, PuzzlePiece, Detector, Matcher, Solver
 
 import cv2
 import numpy as np
+import math
 from dataclasses import dataclass
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from collections import defaultdict
 
 
@@ -17,6 +18,14 @@ class CalibrationData:
     background_sample: Optional[Tuple[int, int, int]] = None  # BGR color
     min_area: int = 500
     max_area: int = 50000
+
+
+@dataclass
+class HoleCalibration:
+    """Calibration settings specific to the puzzle hole analysis."""
+    outer_roi: Optional[Tuple[int, int, int, int]] = None
+    inner_roi: Optional[Tuple[int, int, int, int]] = None
+    background_sample: Optional[Tuple[int, int, int]] = None
 
 
 @dataclass
@@ -278,6 +287,213 @@ class PuzzlePieceDetector:
             return 4  # Three sides
         else:
             return 5  # All sides
+
+
+class HoleAnalyzer:
+    """Analyse the puzzle hole to detect borders and estimate the missing grid."""
+
+    def __init__(self, canny_low=60, canny_high=160):
+        self.canny_low = canny_low
+        self.canny_high = canny_high
+
+    @staticmethod
+    def _cluster_positions(values: List[float], tolerance: float) -> List[int]:
+        if not values:
+            return []
+        values = sorted(values)
+        clusters: List[Tuple[float, int]] = []  # (mean, count)
+        for val in values:
+            if not clusters or abs(val - clusters[-1][0]) > tolerance:
+                clusters.append([val, 1])
+            else:
+                mean, count = clusters[-1]
+                new_count = count + 1
+                new_mean = (mean * count + val) / new_count
+                clusters[-1] = [new_mean, new_count]
+        return [int(round(mean)) for mean, _ in clusters]
+
+    def analyze(self, image: np.ndarray, outer_roi: Optional[Tuple[int, int, int, int]],
+                inner_roi: Optional[Tuple[int, int, int, int]]) -> Dict[str, object]:
+        result: Dict[str, object] = {
+            "status": "missing_rois",
+            "grid_cells": [],
+            "grid_lines": {"vertical": [], "horizontal": []},
+            "missing_count": 0,
+            "debug_layers": {},
+            "border_contour": None,
+        }
+
+        if image is None or outer_roi is None or inner_roi is None:
+            return result
+
+        x_outer, y_outer, w_outer, h_outer = outer_roi
+        x_inner, y_inner, w_inner, h_inner = inner_roi
+
+        x_inner = max(x_outer, x_inner)
+        y_inner = max(y_outer, y_inner)
+        w_inner = min(w_inner, (x_outer + w_outer) - x_inner)
+        h_inner = min(h_inner, (y_outer + h_outer) - y_inner)
+        if w_inner <= 0 or h_inner <= 0:
+            return result
+
+        outer_crop = image[y_outer : y_outer + h_outer, x_outer : x_outer + w_outer]
+        if outer_crop.size == 0:
+            return result
+
+        inner_rel = (x_inner - x_outer, y_inner - y_outer, w_inner, h_inner)
+
+        gray_outer = cv2.cvtColor(outer_crop, cv2.COLOR_BGR2GRAY)
+        blur_outer = cv2.GaussianBlur(gray_outer, (5, 5), 0)
+        outer_mean, outer_std = cv2.meanStdDev(blur_outer)
+        outer_sigma = float(outer_std[0][0])
+        low_outer = int(max(20, min(120, outer_sigma * 0.75 + 20)))
+        high_outer = int(max(low_outer + 40, min(240, outer_sigma * 1.75 + 60)))
+        edges_outer = cv2.Canny(blur_outer, low_outer, high_outer)
+
+        ring_mask = np.zeros_like(edges_outer)
+        cv2.rectangle(ring_mask, (0, 0), (w_outer - 1, h_outer - 1), 255, thickness=-1)
+        cv2.rectangle(
+            ring_mask,
+            (inner_rel[0], inner_rel[1]),
+            (inner_rel[0] + inner_rel[2], inner_rel[1] + inner_rel[3]),
+            0,
+            thickness=-1,
+        )
+
+        border_edges = cv2.bitwise_and(edges_outer, edges_outer, mask=ring_mask)
+        kernel = np.ones((3, 3), np.uint8)
+        border_edges_clean = cv2.morphologyEx(border_edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(border_edges_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        border_contour_abs = None
+        if contours:
+            main_contour = max(contours, key=lambda c: cv2.arcLength(c, True))
+            border_contour_abs = main_contour + np.array([[[x_outer, y_outer]]])
+
+        inner_crop = image[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner]
+        inner_gray = cv2.cvtColor(inner_crop, cv2.COLOR_BGR2GRAY)
+        inner_blur = cv2.GaussianBlur(inner_gray, (5, 5), 0)
+
+        _, inner_std = cv2.meanStdDev(inner_blur)
+        sigma_inner = float(inner_std[0][0])
+        low_inner = int(max(12, min(110, sigma_inner * 1.2 + 15)))
+        high_inner = int(max(low_inner + 30, min(220, sigma_inner * 2.3 + 45)))
+        edges_inner = cv2.Canny(inner_blur, low_inner, high_inner)
+
+        mean_inner = float(cv2.mean(inner_blur)[0])
+        shadow_threshold = max(0, mean_inner - sigma_inner * 0.8 - 5)
+        _, shadow_mask = cv2.threshold(inner_blur, shadow_threshold, 255, cv2.THRESH_BINARY_INV)
+        edges_inner = cv2.bitwise_and(edges_inner, edges_inner, mask=shadow_mask.astype(np.uint8))
+        edges_inner = cv2.morphologyEx(edges_inner, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
+        edges_inner = cv2.morphologyEx(edges_inner, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+
+        inner_color_mean = tuple(int(c) for c in cv2.mean(inner_crop)[:3])
+        result["mean_color"] = inner_color_mean
+
+        min_line_length = max(20, min(w_inner, h_inner) // 3)
+        lines = cv2.HoughLinesP(
+            edges_inner,
+            rho=1,
+            theta=np.pi / 180,
+            threshold=60,
+            minLineLength=min_line_length,
+            maxLineGap=20,
+        )
+
+        vertical_positions: List[float] = []
+        horizontal_positions: List[float] = []
+        if lines is not None:
+            for x1, y1, x2, y2 in lines[:, 0]:
+                dx = x2 - x1
+                dy = y2 - y1
+                if dx == 0 and dy == 0:
+                    continue
+                length = math.hypot(dx, dy)
+                if length < min_line_length:
+                    continue
+                angle = abs(math.degrees(math.atan2(dy, dx)))
+                if angle > 90:
+                    angle = 180 - angle
+
+                if angle > 65:
+                    vertical_positions.append((x1 + x2) / 2.0)
+                elif angle < 25:
+                    horizontal_positions.append((y1 + y2) / 2.0)
+
+        vertical_lines_rel = [0, w_inner]
+        horizontal_lines_rel = [0, h_inner]
+
+        vertical_lines_rel.extend(self._cluster_positions(vertical_positions, tolerance=w_inner * 0.08))
+        horizontal_lines_rel.extend(self._cluster_positions(horizontal_positions, tolerance=h_inner * 0.08))
+
+        vertical_lines_rel = sorted(set(int(round(v)) for v in vertical_lines_rel))
+        horizontal_lines_rel = sorted(set(int(round(v)) for v in horizontal_lines_rel))
+
+        if len(vertical_lines_rel) < 2:
+            vertical_lines_rel = [0, w_inner]
+        if len(horizontal_lines_rel) < 2:
+            horizontal_lines_rel = [0, h_inner]
+
+        grid_cells: List[Tuple[int, int, int, int]] = []
+        for col in range(len(vertical_lines_rel) - 1):
+            x_start = vertical_lines_rel[col]
+            x_end = vertical_lines_rel[col + 1]
+            for row in range(len(horizontal_lines_rel) - 1):
+                y_start = horizontal_lines_rel[row]
+                y_end = horizontal_lines_rel[row + 1]
+                cell_x = x_inner + x_start
+                cell_y = y_inner + y_start
+                cell_w = max(1, x_end - x_start)
+                cell_h = max(1, y_end - y_start)
+                grid_cells.append((cell_x, cell_y, cell_w, cell_h))
+
+        missing_count = len(grid_cells)
+
+        debug_layers: Dict[str, np.ndarray] = {}
+        border_debug = image.copy()
+        if border_contour_abs is not None:
+            cv2.drawContours(border_debug, [border_contour_abs], -1, (0, 255, 255), 2, cv2.LINE_AA)
+        debug_layers["Contours (bord)"] = border_debug
+
+        border_edges_color = cv2.cvtColor(border_edges_clean, cv2.COLOR_GRAY2BGR)
+        border_edges_canvas = np.zeros_like(image)
+        border_edges_canvas[y_outer : y_outer + h_outer, x_outer : x_outer + w_outer] = border_edges_color
+        debug_layers["Edges anneau"] = border_edges_canvas
+
+        inner_edges_color = cv2.cvtColor(edges_inner, cv2.COLOR_GRAY2BGR)
+        inner_edges_canvas = np.zeros_like(image)
+        inner_edges_canvas[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner] = inner_edges_color
+        debug_layers["Contours internes"] = inner_edges_canvas
+
+        shadow_canvas = np.zeros_like(image)
+        shadow_color = cv2.cvtColor(shadow_mask.astype(np.uint8), cv2.COLOR_GRAY2BGR)
+        shadow_canvas[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner] = shadow_color
+        debug_layers["Masque ombre"] = shadow_canvas
+
+        grid_debug = image.copy()
+        for vx in vertical_lines_rel:
+            abs_x = x_inner + vx
+            cv2.line(grid_debug, (abs_x, y_inner), (abs_x, y_inner + h_inner), (99, 214, 255), 2, cv2.LINE_AA)
+        for vy in horizontal_lines_rel:
+            abs_y = y_inner + vy
+            cv2.line(grid_debug, (x_inner, abs_y), (x_inner + w_inner, abs_y), (99, 214, 255), 2, cv2.LINE_AA)
+        debug_layers["Grille estimée"] = grid_debug
+
+        result.update(
+            {
+                "status": "ok",
+                "border_contour": border_contour_abs,
+                "grid_cells": grid_cells,
+                "grid_lines": {
+                    "vertical": [x_inner + int(v) for v in vertical_lines_rel],
+                    "horizontal": [y_inner + int(v) for v in horizontal_lines_rel],
+                },
+                "missing_count": missing_count,
+                "debug_layers": debug_layers,
+            }
+        )
+
+        return result
 
 
 class PuzzleMatcher:
