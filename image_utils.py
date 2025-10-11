@@ -51,7 +51,12 @@ class ImageCache:
 image_cache = ImageCache()
 
 
-def cv2_to_photoimage(cv_img: np.ndarray, max_width: int = None, max_height: int = None) -> Tuple[ImageTk.PhotoImage, int, int]:
+def cv2_to_photoimage(
+    cv_img: np.ndarray,
+    max_width: int = None,
+    max_height: int = None,
+    scale: Optional[float] = None,
+) -> Tuple[ImageTk.PhotoImage, int, int]:
     """
     Convert OpenCV image to a Tk PhotoImage
     Returns: (PhotoImage, display_width, display_height)
@@ -67,17 +72,24 @@ def cv2_to_photoimage(cv_img: np.ndarray, max_width: int = None, max_height: int
     display_width, display_height = width, height
 
     # Resize if needed
-    if max_width or max_height:
-        scale = 1.0
+    if scale is not None:
+        if scale <= 0:
+            raise ValueError("scale must be positive")
+        display_width = max(1, int(round(width * scale)))
+        display_height = max(1, int(round(height * scale)))
+        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        rgb_img = cv2.resize(rgb_img, (display_width, display_height), interpolation=interpolation)
+    elif max_width or max_height:
+        resize_scale = 1.0
         if max_width and width > max_width:
-            scale = min(scale, max_width / width)
+            resize_scale = min(resize_scale, max_width / width)
         if max_height and height > max_height:
-            scale = min(scale, max_height / height)
+            resize_scale = min(resize_scale, max_height / height)
 
-        if scale < 1.0:
-            display_width = int(width * scale)
-            display_height = int(height * scale)
-            rgb_img = cv2.resize(rgb_img, (display_width, display_height))
+        if resize_scale < 1.0:
+            display_width = int(width * resize_scale)
+            display_height = int(height * resize_scale)
+            rgb_img = cv2.resize(rgb_img, (display_width, display_height), interpolation=cv2.INTER_AREA)
 
     # Convert to PIL Image
     pil_img = Image.fromarray(rgb_img)

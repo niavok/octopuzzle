@@ -209,7 +209,401 @@ def init_theme(root: tk.Misc) -> None:
     style.configure("Vertical.TScrollbar", troughcolor=PALETTE["surface"])
 
 
-class CalibrationCanvas(tk.Canvas):
+class ZoomableImageCanvas(tk.Canvas):
+    """Canvas that auto-fits and zooms images around the cursor."""
+
+    def __init__(self, parent, width=800, height=600, max_zoom: float = 6.0, **kwargs):
+        defaults = {
+            "width": width,
+            "height": height,
+            "bg": PALETTE["canvas"],
+            "highlightthickness": 1,
+            "highlightbackground": PALETTE["border"],
+            "bd": 0,
+        }
+        defaults.update(kwargs)
+        super().__init__(parent, **defaults)
+
+        self.base_image = None
+        self.display_image = None
+        self.photo: Optional[ImageTk.PhotoImage] = None
+        self.image_id: Optional[int] = None
+
+        self.zoom = 1.0
+        self.fit_zoom = 1.0
+        self.min_zoom = 1.0
+        self.max_zoom = max_zoom
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.user_zoomed = False
+
+        self.base_width = 0
+        self.base_height = 0
+        self.display_width = 0
+        self.display_height = 0
+
+        self.primary_pan_enabled = False
+        self._pending_render = False
+        self._pan_active = False
+        self._pan_button: Optional[int] = None
+        self._pan_last = (0, 0)
+        self._pan_candidate = None
+        self._space_pan = False
+
+        self.bind("<Configure>", self._on_configure)
+        self.bind("<MouseWheel>", self._on_mousewheel)
+        self.bind("<Button-4>", self._on_mousewheel)
+        self.bind("<Button-5>", self._on_mousewheel)
+        self.bind("<Double-Button-1>", self._on_double_click)
+        self.bind("<Enter>", lambda _evt: self.focus_set())
+        self.bind("<ButtonPress-2>", self._start_pan, add="+")
+        self.bind("<ButtonPress-3>", self._start_pan, add="+")
+        self.bind("<B2-Motion>", self._do_pan, add="+")
+        self.bind("<B3-Motion>", self._do_pan, add="+")
+        self.bind("<ButtonRelease-2>", self._stop_pan, add="+")
+        self.bind("<ButtonRelease-3>", self._stop_pan, add="+")
+        self.bind("<KeyPress-space>", self._on_space_press, add="+")
+        self.bind("<KeyRelease-space>", self._on_space_release, add="+")
+        self.bind("<ButtonPress-1>", self._maybe_start_primary_pan, add="+")
+        self.bind("<B1-Motion>", self._maybe_do_primary_pan, add="+")
+        self.bind("<ButtonRelease-1>", self._maybe_stop_primary_pan, add="+")
+
+    def set_base_image(self, cv_img, reset_view: bool = True):
+        """Assign a new base image (resets the view unless specified)."""
+        if cv_img is None:
+            return
+
+        self.base_image = cv_img
+        self.base_height, self.base_width = cv_img.shape[:2]
+        self.set_display_image(cv_img, reset_view=reset_view)
+
+    def set_display_image(self, cv_img, reset_view: bool = False):
+        """Update the displayed image, preserving zoom unless requested."""
+        if cv_img is None:
+            return
+
+        self.display_image = cv_img
+        if self.base_image is None:
+            self.base_image = cv_img
+            self.base_height, self.base_width = cv_img.shape[:2]
+
+        if reset_view:
+            self.user_zoomed = False
+
+        self._update_fit_zoom(force=reset_view)
+        self._request_render()
+
+    def clear_image(self):
+        """Clear the canvas image and reset zoom state."""
+        if self.image_id is not None:
+            self.delete(self.image_id)
+            self.image_id = None
+
+        self.photo = None
+        self.base_image = None
+        self.display_image = None
+        self.base_width = 0
+        self.base_height = 0
+        self.display_width = 0
+        self.display_height = 0
+
+        self.zoom = 1.0
+        self.fit_zoom = 1.0
+        self.min_zoom = 1.0
+        self.offset_x = 0.0
+        self.offset_y = 0.0
+        self.user_zoomed = False
+        self._pan_active = False
+        self._pan_button = None
+        self._pan_candidate = None
+        self._space_pan = False
+        self._pan_last = (0, 0)
+
+    def reset_view(self):
+        """Reset zoom and centering to fit within the canvas."""
+        if self.display_image is None:
+            return
+        self.user_zoomed = False
+        self._update_fit_zoom(force=True)
+        self._render_image()
+
+    def set_primary_pan_enabled(self, enabled: bool):
+        """Allow panning with the primary button without holding space."""
+        self.primary_pan_enabled = bool(enabled)
+
+    def is_panning(self) -> bool:
+        """Return whether a pan gesture is currently active."""
+        return self._pan_active
+
+    def canvas_to_image(self, x: float, y: float) -> Tuple[Optional[float], Optional[float]]:
+        """Convert canvas coordinates to image coordinates."""
+        if self.display_image is None:
+            return None, None
+
+        img_h, img_w = self.display_image.shape[:2]
+        if img_w == 0 or img_h == 0:
+            return None, None
+
+        canvas_w = max(1, self.winfo_width())
+        canvas_h = max(1, self.winfo_height())
+
+        scaled_w = self.display_width or (img_w * self.zoom)
+        scaled_h = self.display_height or (img_h * self.zoom)
+
+        scale_x = scaled_w / img_w
+        scale_y = scaled_h / img_h
+
+        center_x = canvas_w / 2 + self.offset_x
+        center_y = canvas_h / 2 + self.offset_y
+
+        left = center_x - scaled_w / 2
+        top = center_y - scaled_h / 2
+
+        if x < left or x > left + scaled_w or y < top or y > top + scaled_h:
+            return None, None
+
+        img_x = (x - left) / scale_x
+        img_y = (y - top) / scale_y
+        return img_x, img_y
+
+    def _on_double_click(self, _event):
+        self.reset_view()
+
+    def _on_space_press(self, _event):
+        self._space_pan = True
+
+    def _on_space_release(self, event):
+        self._space_pan = False
+        if self._pan_active and self._pan_button == 1:
+            self._stop_pan(event, force=True)
+
+    def _start_pan(self, event):
+        if self.display_image is None:
+            return
+        button = getattr(event, "num", None)
+        if button is None and hasattr(event, "button"):
+            button = event.button
+        self.focus_set()
+        self._pan_active = True
+        self._pan_button = button
+        self._pan_candidate = None
+        self._pan_last = (event.x, event.y)
+        return "break"
+
+    def _do_pan(self, event):
+        if not self._pan_active:
+            return
+        dx = event.x - self._pan_last[0]
+        dy = event.y - self._pan_last[1]
+        if dx == 0 and dy == 0:
+            return "break"
+        self._pan_last = (event.x, event.y)
+        self.offset_x += dx
+        self.offset_y += dy
+        self.user_zoomed = True
+        self._render_image()
+        return "break"
+
+    def _stop_pan(self, event, force: bool = False):
+        if not self._pan_active:
+            return
+        button = getattr(event, "num", None)
+        if button is None and hasattr(event, "button"):
+            button = event.button
+        if not force and self._pan_button not in (None, button):
+            return
+        self._pan_active = False
+        self._pan_button = None
+        self._pan_candidate = None
+        return "break"
+
+    def _maybe_start_primary_pan(self, event):
+        if self.display_image is None:
+            return
+        if self._space_pan:
+            self.focus_set()
+            self._pan_active = True
+            self._pan_button = 1
+            self._pan_candidate = None
+            self._pan_last = (event.x, event.y)
+            return "break"
+        if self.primary_pan_enabled:
+            self.focus_set()
+            self._pan_candidate = (event.x, event.y)
+
+    def _maybe_do_primary_pan(self, event):
+        if self.display_image is None:
+            return
+        if self._pan_active and self._pan_button == 1:
+            return self._do_pan(event)
+        if self.primary_pan_enabled and self._pan_candidate is not None:
+            start_x, start_y = self._pan_candidate
+            if abs(event.x - start_x) < 1 and abs(event.y - start_y) < 1:
+                return
+            self._pan_button = 1
+            self._pan_active = True
+            self._pan_last = (start_x, start_y)
+            self._pan_candidate = None
+            return self._do_pan(event)
+
+    def _maybe_stop_primary_pan(self, event):
+        if self._pan_active and self._pan_button == 1:
+            return self._stop_pan(event, force=True)
+        if self.primary_pan_enabled:
+            self._pan_candidate = None
+            if not self._pan_active:
+                self._pan_button = None
+
+    def _on_configure(self, _event):
+        if self.display_image is None:
+            return
+        self._update_fit_zoom()
+        self._render_image()
+
+    def _on_mousewheel(self, event):
+        if self.display_image is None:
+            return
+
+        delta = 0
+        if hasattr(event, "delta") and event.delta:
+            delta = event.delta
+        elif hasattr(event, "num"):
+            if event.num == 4:
+                delta = 120
+            elif event.num == 5:
+                delta = -120
+
+        if delta == 0:
+            return
+
+        factor = 1.12 if delta > 0 else 1 / 1.12
+        self._zoom_at(event.x, event.y, factor)
+
+    def _zoom_at(self, canvas_x: float, canvas_y: float, factor: float):
+        if self.display_image is None:
+            return
+
+        new_zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * factor))
+        if abs(new_zoom - self.zoom) < 1e-3:
+            return
+
+        img_coords = self.canvas_to_image(canvas_x, canvas_y)
+        if img_coords[0] is None or img_coords[1] is None:
+            img_x = (self.base_width or self.display_image.shape[1]) / 2
+            img_y = (self.base_height or self.display_image.shape[0]) / 2
+        else:
+            img_x, img_y = img_coords
+
+        self.zoom = new_zoom
+        self.user_zoomed = True
+
+        self._update_offset_after_zoom(img_x, img_y, canvas_x, canvas_y)
+        self._render_image()
+
+    def _update_fit_zoom(self, force: bool = False):
+        if self.display_image is None:
+            return
+
+        canvas_w = max(1, self.winfo_width())
+        canvas_h = max(1, self.winfo_height())
+        if canvas_w <= 1 or canvas_h <= 1:
+            return
+
+        img_h, img_w = self.display_image.shape[:2]
+        if img_w == 0 or img_h == 0:
+            return
+
+        fit = min(canvas_w / img_w, canvas_h / img_h)
+        if fit <= 0:
+            fit = 1.0
+
+        self.fit_zoom = fit
+        self.min_zoom = max(0.1, fit * 0.2)
+
+        if force or not self.user_zoomed:
+            self.zoom = self.fit_zoom
+            self.offset_x = 0.0
+            self.offset_y = 0.0
+        else:
+            if self.zoom < self.min_zoom:
+                self.zoom = self.min_zoom
+
+        scaled_w = (self.display_width or img_w * self.zoom)
+        scaled_h = (self.display_height or img_h * self.zoom)
+        self._clamp_offsets(canvas_w, canvas_h, scaled_w, scaled_h)
+
+    def _update_offset_after_zoom(self, img_x: float, img_y: float, canvas_x: float, canvas_y: float):
+        canvas_w = max(1, self.winfo_width())
+        canvas_h = max(1, self.winfo_height())
+
+        img_h, img_w = self.display_image.shape[:2]
+        scaled_w = img_w * self.zoom
+        scaled_h = img_h * self.zoom
+
+        left = canvas_x - img_x * self.zoom
+        top = canvas_y - img_y * self.zoom
+
+        center_x = left + scaled_w / 2
+        center_y = top + scaled_h / 2
+
+        self.offset_x = center_x - canvas_w / 2
+        self.offset_y = center_y - canvas_h / 2
+
+        self._clamp_offsets(canvas_w, canvas_h, scaled_w, scaled_h)
+
+    def _clamp_offsets(self, canvas_w: float, canvas_h: float, scaled_w: float, scaled_h: float):
+        if scaled_w <= canvas_w:
+            self.offset_x = 0.0
+        else:
+            max_offset_x = (scaled_w - canvas_w) / 2
+            self.offset_x = max(-max_offset_x, min(max_offset_x, self.offset_x))
+
+        if scaled_h <= canvas_h:
+            self.offset_y = 0.0
+        else:
+            max_offset_y = (scaled_h - canvas_h) / 2
+            self.offset_y = max(-max_offset_y, min(max_offset_y, self.offset_y))
+
+    def _request_render(self):
+        if not self._pending_render:
+            self._pending_render = True
+            self.after_idle(self._render_image)
+
+    def _render_image(self):
+        self._pending_render = False
+
+        if self.display_image is None:
+            return
+
+        canvas_w = max(1, self.winfo_width())
+        canvas_h = max(1, self.winfo_height())
+        if canvas_w <= 1 or canvas_h <= 1:
+            self._request_render()
+            return
+
+        photo, display_w, display_h = cv2_to_photoimage(self.display_image, scale=self.zoom)
+        if not photo:
+            return
+
+        self.photo = photo
+        self.display_width = display_w
+        self.display_height = display_h
+
+        self._clamp_offsets(canvas_w, canvas_h, display_w, display_h)
+
+        center_x = canvas_w / 2 + self.offset_x
+        center_y = canvas_h / 2 + self.offset_y
+
+        if self.image_id is None:
+            self.image_id = self.create_image(center_x, center_y, image=photo, anchor=tk.CENTER)
+        else:
+            self.coords(self.image_id, center_x, center_y)
+            self.itemconfig(self.image_id, image=photo)
+
+        self.tag_lower(self.image_id)
+
+
+class CalibrationCanvas(ZoomableImageCanvas):
     """
     Canvas with interactive calibration features:
     - Drag to select ROI
@@ -218,21 +612,7 @@ class CalibrationCanvas(tk.Canvas):
     """
 
     def __init__(self, parent, width=800, height=600, **kwargs):
-        super().__init__(
-            parent,
-            width=width,
-            height=height,
-            bg=PALETTE["canvas"],
-            highlightthickness=1,
-            highlightbackground=PALETTE["border"],
-            bd=0,
-            **kwargs,
-        )
-
-        self.image = None  # Base cv2 image used for coordinate conversions
-        self.base_image = None  # Stored original image for overlays
-        self.photo: Optional[ImageTk.PhotoImage] = None
-        self.image_id = None  # Canvas image ID
+        super().__init__(parent, width=width, height=height, **kwargs)
 
         self.mode = "none"  # 'roi', 'background', or 'none'
         self.roi: Optional[Tuple[int, int, int, int]] = None
@@ -249,10 +629,10 @@ class CalibrationCanvas(tk.Canvas):
         self.on_inner_selected: Optional[Callable[[Tuple[int, int, int, int]], None]] = None
         self.on_background_selected: Optional[Callable[[Tuple[int, int, int]], None]] = None
 
-        # Bind mouse events
-        self.bind("<ButtonPress-1>", self._on_mouse_down)
-        self.bind("<B1-Motion>", self._on_mouse_drag)
-        self.bind("<ButtonRelease-1>", self._on_mouse_up)
+        # Bind mouse events specific to calibration
+        self.bind("<ButtonPress-1>", self._on_mouse_down, add="+")
+        self.bind("<B1-Motion>", self._on_mouse_drag, add="+")
+        self.bind("<ButtonRelease-1>", self._on_mouse_up, add="+")
 
     def set_mode(self, mode: str):
         """Set interaction mode: 'roi', 'background', or 'none'."""
@@ -268,20 +648,19 @@ class CalibrationCanvas(tk.Canvas):
         if cv_img is None:
             return
 
-        self.image = cv_img
-        self.base_image = cv_img
         self.roi = None
         self.outer_roi = None
         self.inner_roi = None
-        self._display_image(cv_img)
+        self.background_sample = None
+        self.set_base_image(cv_img, reset_view=True)
 
     def show_image(self, cv_img):
         """Display provided image without altering base reference."""
-        self._display_image(cv_img)
+        self.set_display_image(cv_img)
 
     def show_debug_image(self, debug_img):
         """Display debug image with contours."""
-        self._display_image(debug_img)
+        self.set_display_image(debug_img)
 
     def draw_roi_overlay(self):
         """Draw ROI overlay on current image."""
@@ -289,44 +668,25 @@ class CalibrationCanvas(tk.Canvas):
             return
 
         img_with_overlay = draw_roi_overlay(self.base_image, self.roi or self.outer_roi, self.inner_roi)
-        self._display_image(img_with_overlay)
+        self.set_display_image(img_with_overlay)
 
     def clear(self):
         """Clear canvas."""
+        super().clear_image()
         self.delete("all")
-        self.image = None
-        self.base_image = None
         self.roi = None
         self.outer_roi = None
         self.inner_roi = None
-        self.photo = None
-        self.image_id = None
-
-    def _display_image(self, cv_img):
-        """Display OpenCV image on canvas."""
-        if cv_img is None:
-            return
-
-        canvas_width = self.winfo_width()
-        canvas_height = self.winfo_height()
-
-        if canvas_width <= 1:
-            canvas_width = int(self["width"])
-        if canvas_height <= 1:
-            canvas_height = int(self["height"])
-
-        photo, _, _ = cv2_to_photoimage(cv_img, canvas_width, canvas_height)
-
-        if photo:
-            self.photo = photo
-            self.delete("all")
-            self.image_id = self.create_image(
-                canvas_width // 2, canvas_height // 2, image=photo, anchor=tk.CENTER
-            )
+        self.background_sample = None
+        self.drag_rect_id = None
+        self.drag_start = None
 
     def _on_mouse_down(self, event):
         """Handle mouse button press."""
         if self.mode == "none":
+            return
+
+        if self.is_panning():
             return
 
         self.drag_start = (event.x, event.y)
@@ -336,8 +696,12 @@ class CalibrationCanvas(tk.Canvas):
         if self.drag_start is None or self.mode == "none":
             return
 
+        if self.is_panning():
+            return
+
         if self.drag_rect_id:
             self.delete(self.drag_rect_id)
+            self.drag_rect_id = None
 
         x1, y1 = self.drag_start
         x2, y2 = event.x, event.y
@@ -363,47 +727,51 @@ class CalibrationCanvas(tk.Canvas):
         if self.drag_start is None or self.mode == "none":
             return
 
+        if self.is_panning():
+            self.drag_start = None
+            return
+
         if self.drag_rect_id:
             self.delete(self.drag_rect_id)
             self.drag_rect_id = None
 
-        x1, y1 = self.drag_start
-        x2, y2 = event.x, event.y
-
-        x = min(x1, x2)
-        y = min(y1, y2)
-        w = abs(x2 - x1)
-        h = abs(y2 - y1)
-
-        if w < 10 or h < 10:
+        if self.base_image is None:
             self.drag_start = None
             return
 
-        if self.image is not None and self.photo is not None:
-            img_h, img_w = self.image.shape[:2]
-            canvas_w = self.winfo_width()
-            canvas_h = self.winfo_height()
+        start = self.canvas_to_image(*self.drag_start)
+        end = self.canvas_to_image(event.x, event.y)
 
-            photo_w = self.photo.width()
-            photo_h = self.photo.height()
-            offset_x = (canvas_w - photo_w) // 2
-            offset_y = (canvas_h - photo_h) // 2
+        if start[0] is None or end[0] is None:
+            self.drag_start = None
+            return
 
-            x -= offset_x
-            y -= offset_y
+        x1, y1 = start
+        x2, y2 = end
 
-            scale_x = img_w / photo_w
-            scale_y = img_h / photo_h
+        min_x = max(0.0, min(x1, x2))
+        min_y = max(0.0, min(y1, y2))
+        max_x = min(float(self.base_width), max(x1, x2))
+        max_y = min(float(self.base_height), max(y1, y2))
 
-            x = int(x * scale_x)
-            y = int(y * scale_y)
-            w = int(w * scale_x)
-            h = int(h * scale_y)
+        width = max_x - min_x
+        height = max_y - min_y
 
-            x = max(0, min(x, img_w - 1))
-            y = max(0, min(y, img_h - 1))
-            w = min(w, img_w - x)
-            h = min(h, img_h - y)
+        if width < 10 or height < 10:
+            self.drag_start = None
+            return
+
+        x = int(round(min_x))
+        y = int(round(min_y))
+        w = int(round(width))
+        h = int(round(height))
+
+        w = min(w, self.base_width - x)
+        h = min(h, self.base_height - y)
+
+        if w <= 0 or h <= 0:
+            self.drag_start = None
+            return
 
         if self.mode == "roi":
             self.roi = (x, y, w, h)
@@ -423,12 +791,13 @@ class CalibrationCanvas(tk.Canvas):
             if self.on_inner_selected:
                 self.on_inner_selected(self.inner_roi)
 
-        elif self.mode == "background" and self.image is not None:
-            roi_img = self.image[y : y + h, x : x + w]
-            avg_color = cv2.mean(roi_img)[:3]
-            self.background_sample = tuple(int(c) for c in avg_color)
-            if self.on_background_selected:
-                self.on_background_selected(self.background_sample)
+        elif self.mode == "background" and self.base_image is not None:
+            roi_img = self.base_image[y : y + h, x : x + w]
+            if roi_img.size > 0:
+                avg_color = cv2.mean(roi_img)[:3]
+                self.background_sample = tuple(int(c) for c in avg_color)
+                if self.on_background_selected:
+                    self.on_background_selected(self.background_sample)
 
         self.drag_start = None
 
@@ -459,14 +828,26 @@ class ImagePanel(tk.Frame):
         self.image_frame.pack(padx=12, pady=8, fill=tk.BOTH, expand=True)
         self.image_frame.pack_propagate(False)
 
-        self.image_label = tk.Label(
+        self.canvas = ZoomableImageCanvas(
+            self.image_frame,
+            width=400,
+            height=400,
+            max_zoom=8.0,
+            bg=PALETTE["surface"],
+            highlightthickness=0,
+            highlightbackground=PALETTE["surface"],
+        )
+        self.canvas.pack(fill=tk.BOTH, expand=True)
+        self.canvas.set_primary_pan_enabled(True)
+
+        self.placeholder = tk.Label(
             self.image_frame,
             bg=PALETTE["surface"],
             fg=PALETTE["muted"],
             text="Image en attente",
             font=("Segoe UI", 12, "italic"),
         )
-        self.image_label.pack(expand=True)
+        self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
 
         self.info_label = tk.Label(
             self,
@@ -478,26 +859,25 @@ class ImagePanel(tk.Frame):
         )
         self.info_label.pack(pady=(0, 10))
 
-        self.photo: Optional[ImageTk.PhotoImage] = None
-
     def set_image(self, cv_img, info_text: str = ""):
         """Set image and info text."""
         if cv_img is None:
             self.clear()
             return
 
-        photo, _, _ = cv2_to_photoimage(cv_img, 380, 380)
+        self.canvas.set_base_image(cv_img, reset_view=True)
+        self.placeholder.place_forget()
 
-        if photo:
-            self.photo = photo
-            self.image_label.config(image=photo, text="")
+        if info_text:
             self.info_label.config(text=info_text, fg=PALETTE["text"])
+        else:
+            self.info_label.config(text="", fg=PALETTE["muted"])
 
     def clear(self):
         """Clear image and info."""
-        self.image_label.config(image="", text="Image en attente")
+        self.canvas.clear_image()
+        self.placeholder.place(relx=0.5, rely=0.5, anchor="center")
         self.info_label.config(text="", fg=PALETTE["muted"])
-        self.photo = None
 
 
 class StatsBar(tk.Frame):
