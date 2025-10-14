@@ -77,7 +77,10 @@ def cv2_to_photoimage(
             raise ValueError("scale must be positive")
         display_width = max(1, int(round(width * scale)))
         display_height = max(1, int(round(height * scale)))
-        interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        if scale < 1.0:
+            interpolation = cv2.INTER_AREA
+        else:
+            interpolation = cv2.INTER_NEAREST
         rgb_img = cv2.resize(rgb_img, (display_width, display_height), interpolation=interpolation)
     elif max_width or max_height:
         resize_scale = 1.0

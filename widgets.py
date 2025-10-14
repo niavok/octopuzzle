@@ -2,6 +2,7 @@
 Custom widgets and theme helpers for Octopuzzle.
 """
 
+import math
 import tkinter as tk
 from tkinter import ttk
 from PIL import ImageTk
@@ -212,7 +213,7 @@ def init_theme(root: tk.Misc) -> None:
 class ZoomableImageCanvas(tk.Canvas):
     """Canvas that auto-fits and zooms images around the cursor."""
 
-    def __init__(self, parent, width=800, height=600, max_zoom: float = 6.0, **kwargs):
+    def __init__(self, parent, width=800, height=600, max_zoom: Optional[float] = None, **kwargs):
         defaults = {
             "width": width,
             "height": height,
@@ -232,7 +233,7 @@ class ZoomableImageCanvas(tk.Canvas):
         self.zoom = 1.0
         self.fit_zoom = 1.0
         self.min_zoom = 1.0
-        self.max_zoom = max_zoom
+        self.max_zoom = None if max_zoom is None or max_zoom <= 0 else float(max_zoom)
         self.offset_x = 0.0
         self.offset_y = 0.0
         self.user_zoomed = False
@@ -241,6 +242,12 @@ class ZoomableImageCanvas(tk.Canvas):
         self.base_height = 0
         self.display_width = 0
         self.display_height = 0
+        self.view_left = 0
+        self.view_top = 0
+        self.view_width = 0
+        self.view_height = 0
+        self.view_canvas_left = 0.0
+        self.view_canvas_top = 0.0
 
         self.primary_pan_enabled = False
         self._pending_render = False
@@ -306,6 +313,12 @@ class ZoomableImageCanvas(tk.Canvas):
         self.base_height = 0
         self.display_width = 0
         self.display_height = 0
+        self.view_left = 0
+        self.view_top = 0
+        self.view_width = 0
+        self.view_height = 0
+        self.view_canvas_left = 0.0
+        self.view_canvas_top = 0.0
 
         self.zoom = 1.0
         self.fit_zoom = 1.0
@@ -341,29 +354,24 @@ class ZoomableImageCanvas(tk.Canvas):
             return None, None
 
         img_h, img_w = self.display_image.shape[:2]
-        if img_w == 0 or img_h == 0:
+        if (
+            img_w == 0
+            or img_h == 0
+            or self.view_width <= 0
+            or self.view_height <= 0
+        ):
             return None, None
 
-        canvas_w = max(1, self.winfo_width())
-        canvas_h = max(1, self.winfo_height())
+        left = self.view_canvas_left
+        top = self.view_canvas_top
+        right = left + self.view_width * self.zoom
+        bottom = top + self.view_height * self.zoom
 
-        scaled_w = self.display_width or (img_w * self.zoom)
-        scaled_h = self.display_height or (img_h * self.zoom)
-
-        scale_x = scaled_w / img_w
-        scale_y = scaled_h / img_h
-
-        center_x = canvas_w / 2 + self.offset_x
-        center_y = canvas_h / 2 + self.offset_y
-
-        left = center_x - scaled_w / 2
-        top = center_y - scaled_h / 2
-
-        if x < left or x > left + scaled_w or y < top or y > top + scaled_h:
+        if x < left or x > right or y < top or y > bottom:
             return None, None
 
-        img_x = (x - left) / scale_x
-        img_y = (y - top) / scale_y
+        img_x = self.view_left + (x - left) / self.zoom
+        img_y = self.view_top + (y - top) / self.zoom
         return img_x, img_y
 
     def _on_double_click(self, _event):
@@ -483,7 +491,10 @@ class ZoomableImageCanvas(tk.Canvas):
         if self.display_image is None:
             return
 
-        new_zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * factor))
+        if self.max_zoom is not None:
+            new_zoom = max(self.min_zoom, min(self.max_zoom, self.zoom * factor))
+        else:
+            new_zoom = max(self.min_zoom, self.zoom * factor)
         if abs(new_zoom - self.zoom) < 1e-3:
             return
 
@@ -522,14 +533,18 @@ class ZoomableImageCanvas(tk.Canvas):
 
         if force or not self.user_zoomed:
             self.zoom = self.fit_zoom
+            if self.max_zoom is not None and self.zoom > self.max_zoom:
+                self.zoom = self.max_zoom
             self.offset_x = 0.0
             self.offset_y = 0.0
         else:
             if self.zoom < self.min_zoom:
                 self.zoom = self.min_zoom
+            if self.max_zoom is not None and self.zoom > self.max_zoom:
+                self.zoom = self.max_zoom
 
-        scaled_w = (self.display_width or img_w * self.zoom)
-        scaled_h = (self.display_height or img_h * self.zoom)
+        scaled_w = img_w * self.zoom
+        scaled_h = img_h * self.zoom
         self._clamp_offsets(canvas_w, canvas_h, scaled_w, scaled_h)
 
     def _update_offset_after_zoom(self, img_x: float, img_y: float, canvas_x: float, canvas_y: float):
@@ -581,7 +596,40 @@ class ZoomableImageCanvas(tk.Canvas):
             self._request_render()
             return
 
-        photo, display_w, display_h = cv2_to_photoimage(self.display_image, scale=self.zoom)
+        img_h, img_w = self.display_image.shape[:2]
+        if img_w == 0 or img_h == 0:
+            return
+
+        total_scaled_w = img_w * self.zoom
+        total_scaled_h = img_h * self.zoom
+
+        left_canvas = canvas_w / 2 + self.offset_x - total_scaled_w / 2
+        top_canvas = canvas_h / 2 + self.offset_y - total_scaled_h / 2
+
+        left_img = max(0, int(math.floor(-left_canvas / self.zoom)))
+        top_img = max(0, int(math.floor(-top_canvas / self.zoom)))
+        right_img = min(img_w, int(math.ceil((canvas_w - left_canvas) / self.zoom)))
+        bottom_img = min(img_h, int(math.ceil((canvas_h - top_canvas) / self.zoom)))
+
+        if right_img <= left_img or bottom_img <= top_img:
+            left_img, top_img = 0, 0
+            right_img, bottom_img = img_w, img_h
+            left_canvas = (canvas_w - total_scaled_w) / 2
+            top_canvas = (canvas_h - total_scaled_h) / 2
+
+        self.view_left = left_img
+        self.view_top = top_img
+        self.view_width = max(1, right_img - left_img)
+        self.view_height = max(1, bottom_img - top_img)
+
+        crop = self.display_image[top_img:bottom_img, left_img:right_img]
+        scaled_w = max(1, int(round(self.view_width * self.zoom)))
+        scaled_h = max(1, int(round(self.view_height * self.zoom)))
+
+        interpolation = cv2.INTER_NEAREST if self.zoom >= 1.0 else cv2.INTER_AREA
+        resized = cv2.resize(crop, (scaled_w, scaled_h), interpolation=interpolation)
+
+        photo, display_w, display_h = cv2_to_photoimage(resized)
         if not photo:
             return
 
@@ -589,10 +637,15 @@ class ZoomableImageCanvas(tk.Canvas):
         self.display_width = display_w
         self.display_height = display_h
 
-        self._clamp_offsets(canvas_w, canvas_h, display_w, display_h)
+        self._clamp_offsets(canvas_w, canvas_h, total_scaled_w, total_scaled_h)
 
-        center_x = canvas_w / 2 + self.offset_x
-        center_y = canvas_h / 2 + self.offset_y
+        canvas_left = max(left_canvas, 0.0)
+        canvas_top = max(top_canvas, 0.0)
+        self.view_canvas_left = canvas_left
+        self.view_canvas_top = canvas_top
+
+        center_x = canvas_left + display_w / 2
+        center_y = canvas_top + display_h / 2
 
         if self.image_id is None:
             self.image_id = self.create_image(center_x, center_y, image=photo, anchor=tk.CENTER)
@@ -832,7 +885,6 @@ class ImagePanel(tk.Frame):
             self.image_frame,
             width=400,
             height=400,
-            max_zoom=8.0,
             bg=PALETTE["surface"],
             highlightthickness=0,
             highlightbackground=PALETTE["surface"],

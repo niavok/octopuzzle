@@ -3,11 +3,19 @@ Octopuzzle - Desktop assistant to help fill uniform puzzle areas.
 Main application with the 3-step workflow (calibrate hole → calibrate pieces → solve).
 """
 
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
-import cv2
-from typing import List, Optional
+import argparse
+import json
+import logging
+import os
+import queue
+import threading
+import time
 from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+
+import cv2
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 
 from models import (
     CalibrationData,
@@ -27,18 +35,132 @@ from widgets import (
     BUTTON_STYLES,
     CHECKBUTTON_STYLE,
 )
-from image_utils import image_cache, extract_piece_image, draw_roi_overlay, draw_grid_overlay
+from image_utils import draw_roi_overlay, extract_piece_image, image_cache
 
-ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+logger = logging.getLogger("octopuzzle")
+propagation_logger = logging.getLogger("octopuzzle.propagation")
+
+ROOT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = ROOT_DIR / "assets"
 ICON_PNG_PATH = ASSETS_DIR / "octopuzzle_icon.png"
 ICON_ICO_PATH = ASSETS_DIR / "octopuzzle_icon.ico"
+
+
+def parse_roi(value: str) -> Tuple[int, int, int, int]:
+    """Parse ROI string formatted as 'x,y,w,h'."""
+    try:
+        parts = [int(token.strip()) for token in value.split(",")]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "Les coordonnées doivent être fournies au format x,y,w,h."
+        ) from exc
+
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("Le format attendu est x,y,w,h (4 entiers).")
+
+    x, y, w, h = parts
+    if w <= 0 or h <= 0:
+        raise argparse.ArgumentTypeError("La largeur et la hauteur doivent être positives.")
+    return x, y, w, h
+
+
+def _roi_to_list(roi: Optional[Tuple[int, int, int, int]]) -> Optional[List[int]]:
+    return list(roi) if roi else None
+
+
+def _tuple_from_sequence(sequence: Optional[List[int]]) -> Optional[Tuple[int, int, int, int]]:
+    if not sequence:
+        return None
+    if len(sequence) != 4:
+        return None
+    return tuple(int(v) for v in sequence)
+
+
+def _color_to_list(color: Optional[Tuple[int, int, int]]) -> Optional[List[int]]:
+    if color is None:
+        return None
+    return [int(c) for c in color]
+
+
+def _color_from_sequence(sequence: Optional[List[int]]) -> Optional[Tuple[int, int, int]]:
+    if not sequence:
+        return None
+    if len(sequence) != 3:
+        return None
+    return tuple(int(c) for c in sequence)
+
+
+def _serialise_path(path_value: Optional[Union[str, Path]]) -> Optional[str]:
+    """Return a POSIX-style string for persistence, relative to the project when possible."""
+    if not path_value:
+        return None
+    path_obj = Path(path_value)
+    try:
+        relative = path_obj.relative_to(ROOT_DIR)
+        return relative.as_posix()
+    except Exception:
+        return path_obj.as_posix()
+
+
+def _paths_equal(a: Union[str, Path], b: Union[str, Path]) -> bool:
+    """Return True if two paths refer to the same location (best-effort, tolerant)."""
+    try:
+        path_a = Path(a).expanduser().resolve(strict=False)
+        path_b = Path(b).expanduser().resolve(strict=False)
+        return path_a == path_b
+    except Exception:
+        return str(a).replace("\\", "/") == str(b).replace("\\", "/")
+
+
+def _candidate_paths(path_value: Union[str, Path]) -> List[Path]:
+    """Generate plausible filesystem paths for a resource, handling Windows separators."""
+    candidates: List[Path] = []
+    seen: set[str] = set()
+
+    if path_value is None:
+        return candidates
+
+    raw = Path(path_value)
+
+    def add_candidate(candidate: Path) -> None:
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(candidate)
+
+    add_candidate(raw.expanduser())
+
+    if isinstance(path_value, str):
+        if "\\" in path_value:
+            add_candidate(Path(path_value.replace("\\", "/")).expanduser())
+        if "/" in path_value:
+            add_candidate(Path(path_value.replace("/", os.sep)).expanduser())
+
+    for base in (Path.cwd(), ROOT_DIR):
+        if not raw.is_absolute():
+            add_candidate(base / raw)
+            if isinstance(path_value, str) and "\\" in path_value:
+                add_candidate(base / Path(path_value.replace("\\", "/")))
+
+    return candidates
+
+
+def find_existing_path(path_value: Union[str, Path]) -> Optional[Path]:
+    """Return the first candidate path that exists on disk."""
+    for candidate in _candidate_paths(path_value):
+        if candidate.exists():
+            return candidate
+    return None
 
 
 class OctopuzzleApp(tk.Tk):
     """Main application window."""
 
-    def __init__(self):
+    def __init__(self, args: Optional[argparse.Namespace] = None):
         super().__init__()
+
+        self.cli_args = args or argparse.Namespace()
+        self.save_session_path: Optional[Path] = getattr(self.cli_args, "save_session", None)
 
         init_theme(self)
         self.title("Octopuzzle")
@@ -76,6 +198,8 @@ class OctopuzzleApp(tk.Tk):
         # Handle cleanup on close
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
+        self.after(150, self._apply_startup_configuration)
+
     def show_step(self, step_num: int):
         """Show specific step"""
         self.step1.pack_forget()
@@ -89,6 +213,83 @@ class OctopuzzleApp(tk.Tk):
         elif step_num == 3:
             self.step3.pack(fill=tk.BOTH, expand=True)
 
+    def _apply_startup_configuration(self):
+        """Load session data or CLI overrides right after the UI is ready."""
+        args = self.cli_args
+
+        session_path = getattr(args, "load_session", None)
+        if session_path:
+            session_path = Path(session_path)
+            if session_path.exists():
+                try:
+                    self.load_session(session_path)
+                    logger.info("Session chargée depuis %s", session_path)
+                except Exception as exc:
+                    logger.exception("Échec du chargement de la session %s", session_path)
+                    messagebox.showwarning(
+                        "Octopuzzle",
+                        f"Impossible de charger la session {session_path}.\n{exc}",
+                    )
+            else:
+                logger.error("Fichier de session introuvable : %s", session_path)
+                messagebox.showwarning(
+                    "Octopuzzle",
+                    f"Le fichier de session {session_path} est introuvable.",
+                )
+
+        # Apply CLI overrides after the session load so they can supersede saved values.
+        try:
+            self.step1.apply_cli_overrides(args)
+        except Exception:
+            logger.exception("Échec de l'application des options CLI pour l'étape 1.")
+
+        try:
+            self.step2.apply_cli_overrides(args)
+        except Exception:
+            logger.exception("Échec de l'application des options CLI pour l'étape 2.")
+
+    def export_session(self) -> Dict[str, Any]:
+        """Export the current calibration/session state to a serialisable dict."""
+        return {
+            "version": 1,
+            "hole": self.step1.export_state(),
+            "pieces": self.step2.export_state(),
+        }
+
+    def save_session(self, path: Path) -> None:
+        """Persist the current session to the given path."""
+        try:
+            data = self.export_session()
+            path = Path(path)
+            if path.parent and not path.parent.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("w", encoding="utf-8") as fh:
+                json.dump(data, fh, indent=2, ensure_ascii=False)
+            logger.info("Session sauvegardée dans %s", path)
+        except Exception:
+            logger.exception("Échec de la sauvegarde de la session %s", path)
+            raise
+
+    def load_session(self, path: Path) -> None:
+        """Load a session from JSON and apply it to the UI."""
+        path = Path(path)
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+
+        if not isinstance(payload, dict):
+            raise ValueError("Format de session invalide (dict attendu).")
+
+        version = int(payload.get("version", 1))
+        if version != 1:
+            raise ValueError(f"Version de session non supportée : {version}")
+
+        hole_state = payload.get("hole")
+        pieces_state = payload.get("pieces")
+
+        self.show_step(1)
+        self.step1.apply_state(hole_state)
+        self.step2.apply_state(pieces_state)
+
     def make_button(self, parent, text: str, command=None, variant: str = "accent"):
         """Factory for themed buttons."""
         style = BUTTON_STYLES.get(variant, BUTTON_STYLES["accent"])
@@ -96,6 +297,19 @@ class OctopuzzleApp(tk.Tk):
 
     def on_close(self):
         """Cleanup and close"""
+        try:
+            self.step1.stop_auto_propagation()
+        except Exception:
+            pass
+        if self.save_session_path:
+            try:
+                self.save_session(self.save_session_path)
+            except Exception as exc:
+                logger.exception("Impossible d'enregistrer la session %s", self.save_session_path)
+                messagebox.showwarning(
+                    "Octopuzzle",
+                    f"Impossible d'enregistrer la session {self.save_session_path}.\n{exc}",
+                )
         image_cache.cleanup()
         self.destroy()
 
@@ -126,12 +340,14 @@ class Step1Frame(tk.Frame):
     """Step 1: Load and analyse the puzzle hole."""
 
     DEBUG_LAYERS_ORDER = [
-        "Contours (bord)",
-        "Edges anneau",
-        "Contours internes",
-        "Masque ombre",
-        "Grille estimée",
+        "Masque (overlay)",
+        "Carte des états",
+        "Contours Canny (propagation)",
+        "Zone externe floutée",
     ]
+
+    AUTO_PIXELS_PER_FRAME = 20000
+    AUTO_CHUNK_SIZE = 1024
 
     def __init__(self, parent, app):
         super().__init__(parent, bg=PALETTE["background"])
@@ -140,6 +356,11 @@ class Step1Frame(tk.Frame):
         self.base_image = None
         self.analysis = {}
         self.analysis_display = None
+        self.param_update_after = None
+        self.last_frame_time = time.perf_counter()
+        self.auto_pixels_budget = float(self.AUTO_PIXELS_PER_FRAME)
+        self.auto_chunk_size = float(self.AUTO_CHUNK_SIZE)
+        self._suspend_param_updates = 0
 
         header_frame = tk.Frame(self, bg=PALETTE["background"])
         header_frame.pack(fill=tk.X, pady=(20, 8), padx=24)
@@ -160,7 +381,16 @@ class Step1Frame(tk.Frame):
         )
         self.debug_toggle.pack(side=tk.LEFT, padx=(0, 8))
 
-        self.debug_layer_var = tk.StringVar(value="Contours (bord)")
+        self.fps_label = tk.Label(
+            debug_frame,
+            text="FPS : idle",
+            bg=PALETTE["background"],
+            fg=PALETTE["muted"],
+            font=("Segoe UI", 10),
+        )
+        self.fps_label.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.debug_layer_var = tk.StringVar(value=self.DEBUG_LAYERS_ORDER[0])
         self.debug_layer_combo = ttk.Combobox(
             debug_frame,
             textvariable=self.debug_layer_var,
@@ -168,6 +398,8 @@ class Step1Frame(tk.Frame):
             width=22,
         )
         self.debug_layer_combo.bind("<<ComboboxSelected>>", lambda _evt: self.render_display())
+
+        self._schedule_fps_idle()
 
         subheader = tk.Label(
             self,
@@ -186,15 +418,55 @@ class Step1Frame(tk.Frame):
         content = tk.Frame(self, bg=PALETTE["background"])
         content.pack(fill=tk.BOTH, expand=True, padx=24, pady=(0, 20))
 
-        controls = tk.Frame(
+        controls_container = tk.Frame(
             content,
             bg=PALETTE["panel"],
             highlightbackground=PALETTE["border"],
             highlightthickness=1,
             width=340,
         )
-        controls.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
-        controls.pack_propagate(False)
+        controls_container.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
+        controls_container.pack_propagate(False)
+
+        self.controls_canvas = tk.Canvas(
+            controls_container,
+            bg=PALETTE["panel"],
+            highlightthickness=0,
+            bd=0,
+        )
+        self.controls_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        controls_scrollbar = ttk.Scrollbar(
+            controls_container,
+            orient=tk.VERTICAL,
+            command=self.controls_canvas.yview,
+        )
+        controls_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        self.controls_canvas.configure(yscrollcommand=controls_scrollbar.set)
+
+        self.controls_inner = tk.Frame(self.controls_canvas, bg=PALETTE["panel"])
+        self.controls_window = self.controls_canvas.create_window(
+            (0, 0), window=self.controls_inner, anchor="nw"
+        )
+
+        self.controls_inner.bind(
+            "<Configure>",
+            lambda e: self.controls_canvas.configure(scrollregion=self.controls_canvas.bbox("all")),
+        )
+        self.controls_canvas.bind(
+            "<Configure>",
+            lambda e: self.controls_canvas.itemconfigure(self.controls_window, width=e.width),
+        )
+
+        self.controls_inner.bind("<Enter>", self._enable_controls_scroll)
+        self.controls_inner.bind("<Leave>", self._disable_controls_scroll)
+
+        controls = self.controls_inner
+        try:
+            self.app.hole_analyzer.set_debug(False)
+        except Exception:
+            pass
 
         tk.Label(
             controls,
@@ -233,6 +505,78 @@ class Step1Frame(tk.Frame):
         )
         self.btn_refresh.pack(fill=tk.X, padx=20, pady=(6, 10))
         self.btn_refresh.state(["disabled"])
+
+        blur_frame = tk.Frame(controls, bg=PALETTE["panel"])
+        blur_frame.pack(fill=tk.X, padx=20, pady=(0, 12))
+        tk.Label(
+            blur_frame,
+            text="Flou (taille du kernel)",
+            font=("Segoe UI Semibold", 11),
+            bg=PALETTE["panel"],
+            fg=PALETTE["text"],
+        ).pack(anchor=tk.W, pady=(0, 4))
+        self.blur_kernel_var = tk.IntVar(value=5)
+        self.blur_kernel_input = ttk.Spinbox(
+            blur_frame,
+            from_=1,
+            to=51,
+            increment=2,
+            textvariable=self.blur_kernel_var,
+            width=8,
+        )
+        self.blur_kernel_input.pack(anchor=tk.W)
+
+        edges_frame = tk.Frame(controls, bg=PALETTE["panel"])
+        edges_frame.pack(fill=tk.X, padx=20, pady=(0, 12))
+        tk.Label(
+            edges_frame,
+            text="Seuils Canny (bord)",
+            font=("Segoe UI Semibold", 11),
+            bg=PALETTE["panel"],
+            fg=PALETTE["text"],
+        ).pack(anchor=tk.W, pady=(0, 4))
+
+        thresholds_row = tk.Frame(edges_frame, bg=PALETTE["panel"])
+        thresholds_row.pack(fill=tk.X)
+
+        tk.Label(
+            thresholds_row,
+            text="Bas",
+            bg=PALETTE["panel"],
+            fg=PALETTE["muted"],
+        ).pack(side=tk.LEFT)
+
+        self.canny_low_var = tk.IntVar(value=45)
+        low_spin = ttk.Spinbox(
+            thresholds_row,
+            from_=0,
+            to=500,
+            increment=5,
+            textvariable=self.canny_low_var,
+            width=6,
+        )
+        low_spin.pack(side=tk.LEFT, padx=(8, 16))
+
+        tk.Label(
+            thresholds_row,
+            text="Haut",
+            bg=PALETTE["panel"],
+            fg=PALETTE["muted"],
+        ).pack(side=tk.LEFT)
+
+        self.canny_high_var = tk.IntVar(value=110)
+        high_spin = ttk.Spinbox(
+            thresholds_row,
+            from_=1,
+            to=600,
+            increment=5,
+            textvariable=self.canny_high_var,
+            width=6,
+        )
+        high_spin.pack(side=tk.LEFT, padx=(8, 0))
+        self.blur_kernel_var.trace_add("write", self.on_parameter_changed)
+        self.canny_low_var.trace_add("write", self.on_parameter_changed)
+        self.canny_high_var.trace_add("write", self.on_parameter_changed)
 
         tk.Label(
             controls,
@@ -277,6 +621,40 @@ class Step1Frame(tk.Frame):
         self.status_display = CalibrationStatusDisplay(controls)
         self.status_display.pack(fill=tk.X, padx=18, pady=(12, 8))
 
+        propagation_frame = tk.Frame(controls, bg=PALETTE["panel"])
+        propagation_frame.pack(fill=tk.X, padx=20, pady=(6, 8))
+
+        self.step_mode_var = tk.BooleanVar(value=False)
+        self.step_mode_toggle = ttk.Checkbutton(
+            propagation_frame,
+            text="Mode pas à pas",
+            variable=self.step_mode_var,
+            command=self.on_step_mode_toggle,
+            style=CHECKBUTTON_STYLE,
+        )
+        self.step_mode_toggle.pack(anchor=tk.W)
+
+        step_buttons = tk.Frame(propagation_frame, bg=PALETTE["panel"])
+        step_buttons.pack(fill=tk.X, pady=(6, 0))
+
+        self.btn_step_pixel = self.app.make_button(
+            step_buttons,
+            "▶ 1 pixel",
+            self.step_one_pixel,
+            variant="ghost",
+        )
+        self.btn_step_pixel.pack(side=tk.LEFT, expand=True, fill=tk.X, padx=(0, 6))
+        self.btn_step_pixel.state(["disabled"])
+
+        self.btn_step_loop = self.app.make_button(
+            step_buttons,
+            "⟳ 1 boucle",
+            self.step_one_loop,
+            variant="ghost",
+        )
+        self.btn_step_loop.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        self.btn_step_loop.state(["disabled"])
+
         self.summary_label = tk.Label(
             controls,
             text="Analyse en attente.",
@@ -313,6 +691,22 @@ class Step1Frame(tk.Frame):
 
         self.detected_pieces = None
 
+        self.btn_import_calib = self.app.make_button(
+            controls,
+            "📂 Charger une calibration…",
+            self.import_calibration,
+            variant="secondary",
+        )
+        self.btn_import_calib.pack(fill=tk.X, padx=20, pady=(2, 4))
+
+        self.btn_export_calib = self.app.make_button(
+            controls,
+            "💾 Sauvegarder la calibration…",
+            self.export_calibration,
+            variant="secondary",
+        )
+        self.btn_export_calib.pack(fill=tk.X, padx=20, pady=(0, 12))
+
         self.btn_next = self.app.make_button(
             controls,
             "Étape suivante · Pièces disponibles →",
@@ -328,6 +722,32 @@ class Step1Frame(tk.Frame):
         self.canvas.pack(fill=tk.BOTH, expand=True)
         self.canvas.on_outer_selected = self.on_outer_selected
         self.canvas.on_inner_selected = self.on_inner_selected
+
+        self.auto_running = False
+        self.worker_thread = None
+        self.worker_queue = None
+        self.worker_stop_event = None
+        self.worker_poll_after = None
+
+    def _on_controls_mousewheel(self, event):
+        if event.delta:
+            delta = -int(event.delta / 120)
+            self.controls_canvas.yview_scroll(delta, "units")
+        elif event.num == 4:
+            self.controls_canvas.yview_scroll(-3, "units")
+        elif event.num == 5:
+            self.controls_canvas.yview_scroll(3, "units")
+        return "break"
+
+    def _enable_controls_scroll(self, _event):
+        self.controls_canvas.bind_all("<MouseWheel>", self._on_controls_mousewheel)
+        self.controls_canvas.bind_all("<Button-4>", self._on_controls_mousewheel)
+        self.controls_canvas.bind_all("<Button-5>", self._on_controls_mousewheel)
+
+    def _disable_controls_scroll(self, _event):
+        self.controls_canvas.unbind_all("<MouseWheel>")
+        self.controls_canvas.unbind_all("<Button-4>")
+        self.controls_canvas.unbind_all("<Button-5>")
 
     def activate_mode(self, mode: str):
         if self.base_image is None:
@@ -345,11 +765,42 @@ class Step1Frame(tk.Frame):
         )
         if not path:
             return
+        self.load_image_from_path(path, silent=False)
 
-        img = cv2.imread(path)
-        if img is None:
-            messagebox.showerror("Octopuzzle", "Impossible de charger cette image.")
-            return
+    def load_image_from_path(self, path: Union[str, Path], *, silent: bool = False) -> bool:
+        if not path:
+            return False
+
+        source_str = str(path)
+        resolved_path = None
+        img = None
+
+        for candidate in _candidate_paths(path):
+            img = cv2.imread(str(candidate))
+            if img is not None:
+                resolved_path = str(candidate)
+                break
+
+        if img is None or resolved_path is None:
+            logger.error("Impossible de charger l'image du trou %s", source_str)
+            if not silent:
+                messagebox.showerror("Octopuzzle", "Impossible de charger cette image.")
+            return False
+
+        if resolved_path != source_str:
+            logger.debug("Image du trou résolue : %s → %s", source_str, resolved_path)
+
+        self._apply_loaded_image(resolved_path, img)
+        return True
+
+    def _apply_loaded_image(self, path: str, img) -> None:
+        self.stop_auto_propagation()
+        if self.param_update_after is not None:
+            try:
+                self.after_cancel(self.param_update_after)
+            except Exception:
+                pass
+            self.param_update_after = None
 
         self.app.puzzle_image_path = path
         self.base_image = img
@@ -375,12 +826,146 @@ class Step1Frame(tk.Frame):
         self.analysis = {}
         self.analysis_display = None
         self.debug_enabled.set(False)
+        self.app.hole_analyzer.reset()
         self.update_debug_controls()
+        self.update_step_controls()
+        self.last_frame_time = None
 
         self.btn_select_outer.state(["!disabled"])
         self.btn_select_inner.state(["disabled"])
         self.btn_refresh.state(["disabled"])
         self.btn_next.state(["disabled"])
+
+    def import_calibration(self):
+        """Load a previously saved session via file dialog."""
+        path = filedialog.askopenfilename(
+            title="Charger une calibration Octopuzzle",
+            filetypes=[("Session Octopuzzle", "*.json"), ("Tous les fichiers", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.app.load_session(Path(path))
+        except Exception as exc:
+            logger.exception("Échec du chargement de la calibration %s", path)
+            messagebox.showerror(
+                "Octopuzzle",
+                f"Impossible de charger la calibration sélectionnée.\n{exc}",
+            )
+
+    def export_calibration(self):
+        """Save the current session via a file dialog."""
+        path = filedialog.asksaveasfilename(
+            title="Sauvegarder la calibration Octopuzzle",
+            defaultextension=".json",
+            filetypes=[("Session Octopuzzle", "*.json"), ("Tous les fichiers", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            self.app.save_session(Path(path))
+        except Exception as exc:
+            logger.exception("Échec de la sauvegarde de la calibration %s", path)
+            messagebox.showerror(
+                "Octopuzzle",
+                f"Impossible d'enregistrer la calibration.\n{exc}",
+            )
+
+    def export_state(self) -> Dict[str, Any]:
+        """Return the calibration state for persistence."""
+        return {
+            "image_path": _serialise_path(self.app.puzzle_image_path),
+            "outer_roi": _roi_to_list(self.app.puzzle_calibration.outer_roi),
+            "inner_roi": _roi_to_list(self.app.puzzle_calibration.inner_roi),
+            "blur_kernel": int(self.blur_kernel_var.get()),
+            "canny_low": int(self.canny_low_var.get()),
+            "canny_high": int(self.canny_high_var.get()),
+            "min_area": int(self.min_area_var.get()),
+            "max_area": int(self.max_area_var.get()),
+        }
+
+    def apply_state(self, state: Optional[Dict[str, Any]]) -> None:
+        """Restore calibration state from persisted data."""
+        if not state:
+            return
+
+        image_path = state.get("image_path")
+        if image_path:
+            if not self.load_image_from_path(image_path, silent=True):
+                logger.warning("Impossible de recharger l'image du trou %s", image_path)
+
+        if "blur_kernel" in state:
+            self._set_var_safely(self.blur_kernel_var, int(state["blur_kernel"]))
+        if "canny_low" in state:
+            self._set_var_safely(self.canny_low_var, int(state["canny_low"]))
+        if "canny_high" in state:
+            self._set_var_safely(self.canny_high_var, int(state["canny_high"]))
+        if "min_area" in state:
+            self._set_var_safely(self.min_area_var, int(state["min_area"]))
+        if "max_area" in state:
+            self._set_var_safely(self.max_area_var, int(state["max_area"]))
+
+        if self.base_image is None:
+            # Without image there is nothing else to restore.
+            return
+
+        outer_roi = _tuple_from_sequence(state.get("outer_roi"))
+        inner_roi = _tuple_from_sequence(state.get("inner_roi"))
+
+        if outer_roi:
+            self.canvas.outer_roi = outer_roi
+            self.on_outer_selected(outer_roi)
+
+        if inner_roi:
+            self.canvas.inner_roi = inner_roi
+            self.on_inner_selected(inner_roi)
+
+    def apply_cli_overrides(self, args: argparse.Namespace) -> None:
+        """Apply command-line overrides when launching the app."""
+        hole_image = getattr(args, "hole_image", None)
+        if hole_image:
+            resolved = find_existing_path(hole_image) or Path(hole_image)
+            already_loaded = (
+                self.app.puzzle_image_path is not None
+                and resolved is not None
+                and _paths_equal(self.app.puzzle_image_path, resolved)
+            )
+            if self.base_image is None and resolved is not None:
+                self.load_image_from_path(resolved, silent=True)
+                logger.info("Image du trou chargée depuis la CLI : %s", resolved)
+            elif not already_loaded and resolved is not None:
+                self.load_image_from_path(resolved, silent=True)
+                logger.info("Image du trou rechargée depuis la CLI : %s", resolved)
+
+        if getattr(args, "blur_kernel", None) is not None:
+            self._set_var_safely(self.blur_kernel_var, int(args.blur_kernel))
+        if getattr(args, "canny_low", None) is not None:
+            self._set_var_safely(self.canny_low_var, int(args.canny_low))
+        if getattr(args, "canny_high", None) is not None:
+            self._set_var_safely(self.canny_high_var, int(args.canny_high))
+        if getattr(args, "min_area", None) is not None:
+            self._set_var_safely(self.min_area_var, int(args.min_area))
+        if getattr(args, "max_area", None) is not None:
+            self._set_var_safely(self.max_area_var, int(args.max_area))
+
+        if self.base_image is None:
+            outer_roi = getattr(args, "outer_roi", None)
+            inner_roi = getattr(args, "inner_roi", None)
+            if outer_roi or inner_roi:
+                logger.warning(
+                    "Options --outer-roi / --inner-roi ignorées : aucune image n'est chargée."
+                )
+            return
+
+        outer_roi = getattr(args, "outer_roi", None)
+        if outer_roi:
+            self.canvas.outer_roi = outer_roi
+            self.on_outer_selected(outer_roi)
+
+        inner_roi = getattr(args, "inner_roi", None)
+        if inner_roi:
+            self.canvas.inner_roi = inner_roi
+            self.on_inner_selected(inner_roi)
 
     def on_outer_selected(self, roi):
         self.app.puzzle_calibration.outer_roi = roi
@@ -389,6 +974,7 @@ class Step1Frame(tk.Frame):
         self.btn_select_inner.state(["!disabled"])
         self.btn_refresh.state(["!disabled"])
         self.canvas.set_mode("none")
+        propagation_logger.info("ROI externe définie : %s", roi)
         self.run_analysis()
 
     def on_inner_selected(self, roi):
@@ -396,6 +982,7 @@ class Step1Frame(tk.Frame):
         self.status_display.update_inner_roi(roi)
         self.summary_label.config(text="Zone interne définie. Analyse en cours...")
         self.canvas.set_mode("none")
+        propagation_logger.info("ROI interne définie : %s", roi)
         self.run_analysis()
 
     def on_background_selected(self, bg_color):
@@ -403,8 +990,40 @@ class Step1Frame(tk.Frame):
         pass
 
     def on_debug_toggle(self):
+        try:
+            self.app.hole_analyzer.set_debug(self.debug_enabled.get())
+        except Exception:
+            propagation_logger.exception("Impossible de basculer le mode debug.")
         self.update_debug_controls()
-        self.render_display()
+        current = self.app.hole_analyzer.get_result()
+        if current:
+            self.apply_analysis_result(current)
+        else:
+            self.render_display()
+
+    def _set_var_safely(self, var: tk.Variable, value: int) -> None:
+        """Assign a tkinter variable without triggering parameter recomputation."""
+        self._suspend_param_updates += 1
+        try:
+            var.set(value)
+        finally:
+            self._suspend_param_updates = max(0, self._suspend_param_updates - 1)
+
+    def _schedule_fps_idle(self):
+        self.after(500, self._fps_idle_tick)
+
+    def _fps_idle_tick(self):
+        if not self.winfo_exists():
+            return
+        if self.last_frame_time is None:
+            self.fps_label.config(text="FPS : idle")
+        else:
+            idle_dt = time.perf_counter() - self.last_frame_time
+            if idle_dt > 0.8:
+                self.fps_label.config(text="FPS : idle")
+                if propagation_logger.isEnabledFor(logging.DEBUG):
+                    propagation_logger.debug("Propagation idle détectée (%.3fs sans frame).", idle_dt)
+        self._schedule_fps_idle()
 
     def update_debug_controls(self):
         if self.debug_enabled.get() and self.analysis.get("debug_layers"):
@@ -422,67 +1041,405 @@ class Step1Frame(tk.Frame):
             if self.debug_layer_combo.winfo_ismapped():
                 self.debug_layer_combo.pack_forget()
 
+    def get_blur_kernel(self) -> int:
+        """Return a valid odd kernel size."""
+        try:
+            value = int(self.blur_kernel_var.get())
+        except Exception:
+            value = 5
+            self._set_var_safely(self.blur_kernel_var, value)
+        value = max(1, value)
+        if value % 2 == 0:
+            value = value + 1 if value < 51 else value - 1
+            self._set_var_safely(self.blur_kernel_var, value)
+        return value
+
+    def get_canny_thresholds(self) -> Tuple[int, int]:
+        """Return sanitised Canny thresholds (low, high)."""
+        try:
+            low = int(self.canny_low_var.get())
+        except Exception:
+            low = 45
+            self._set_var_safely(self.canny_low_var, low)
+        try:
+            high = int(self.canny_high_var.get())
+        except Exception:
+            high = 110
+            self._set_var_safely(self.canny_high_var, high)
+
+        low = max(0, low)
+        high = max(low + 1, high)
+
+        self._set_var_safely(self.canny_low_var, low)
+        self._set_var_safely(self.canny_high_var, high)
+        return low, high
+
+    def on_parameter_changed(self, *_args):
+        """Debounced hook to recompute the propagation when parameters change."""
+        if self._suspend_param_updates:
+            return
+        if self.param_update_after is not None:
+            try:
+                self.after_cancel(self.param_update_after)
+            except Exception:
+                pass
+            self.param_update_after = None
+
+        if self.base_image is None:
+            return
+        if not (
+            self.app.puzzle_calibration.outer_roi
+            and self.app.puzzle_calibration.inner_roi
+        ):
+            return
+
+        self.param_update_after = self.after(200, self._apply_parameter_update)
+
+    def _apply_parameter_update(self):
+        self.param_update_after = None
+        self.run_analysis()
+
+    def on_step_mode_toggle(self):
+        """Handle toggling of the step-by-step mode."""
+        if self.step_mode_var.get():
+            self.stop_auto_propagation()
+            self.update_step_controls()
+            return
+
+        # Auto mode
+        if (
+            self.analysis
+            and self.analysis.get("status") == "ok"
+            and not self.analysis.get("complete", False)
+        ):
+            self.start_auto_propagation()
+        self.update_step_controls()
+
+    def update_step_controls(self):
+        """Enable or disable stepping buttons."""
+        if (
+            self.step_mode_var.get()
+            and self.analysis
+            and self.analysis.get("status") == "ok"
+            and not self.analysis.get("complete", False)
+        ):
+            self.btn_step_pixel.state(["!disabled"])
+            self.btn_step_loop.state(["!disabled"])
+        else:
+            self.btn_step_pixel.state(["disabled"])
+            self.btn_step_loop.state(["disabled"])
+
+    def start_auto_propagation(self):
+        """Launch propagation in a background worker and poll results."""
+        if self.step_mode_var.get():
+            return
+        if not self.analysis or self.analysis.get("status") != "ok":
+            return
+        if self.analysis.get("complete", False):
+            return
+        if self.auto_running and self.worker_thread and self.worker_thread.is_alive():
+            return
+
+        processed = self.analysis.get("processed_pixels", 0)
+        frontier = self.analysis.get("frontier_count", 0)
+        pending = self.analysis.get("pending_count", 0)
+        propagation_logger.info(
+            "Auto-propagation démarrée (processed=%d, frontier=%d, pending=%d, budget=%.0f, chunk=%.0f).",
+            processed,
+            frontier,
+            pending,
+            self.auto_pixels_budget,
+            self.auto_chunk_size,
+        )
+        self.auto_running = True
+        self.worker_queue = queue.Queue(maxsize=2)
+        self.worker_stop_event = threading.Event()
+        self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self.worker_thread.start()
+        self._schedule_worker_poll()
+
+    def _schedule_worker_poll(self):
+        if self.worker_poll_after is not None:
+            try:
+                self.after_cancel(self.worker_poll_after)
+            except Exception:
+                pass
+        self.worker_poll_after = self.after(16, self._poll_worker_queue)
+
+    def _poll_worker_queue(self):
+        self.worker_poll_after = None
+        queue_ref = self.worker_queue
+        if queue_ref is None:
+            return
+
+        stop_requested = False
+        while True:
+            try:
+                latest = queue_ref.get_nowait()
+            except queue.Empty:
+                break
+            self.apply_analysis_result(latest)
+            status = latest.get("status")
+            if status != "ok" or latest.get("complete", False):
+                stop_requested = True
+                break
+
+        if stop_requested:
+            self.stop_auto_propagation()
+            return
+
+        if self.auto_running and self.worker_thread and self.worker_thread.is_alive():
+            self._schedule_worker_poll()
+        else:
+            self.auto_running = False
+
+    def _enqueue_worker_result(self, queue_ref: queue.Queue, result: Dict[str, object]) -> None:
+        if queue_ref is None:
+            return
+        try:
+            queue_ref.put_nowait(result)
+        except queue.Full:
+            try:
+                queue_ref.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                queue_ref.put_nowait(result)
+            except queue.Full:
+                pass
+
+    def _worker_loop(self):
+        stop_event = self.worker_stop_event
+        queue_ref = self.worker_queue
+        analyzer = self.app.hole_analyzer
+
+        while stop_event and not stop_event.is_set():
+            chunk_size = int(max(1, float(self.auto_chunk_size)))
+            result = analyzer.advance_pixels(chunk_size)
+            self._enqueue_worker_result(queue_ref, result)
+
+            if result.get("status") != "ok" or result.get("complete", False):
+                break
+
+            time.sleep(0.0)
+
+    def stop_auto_propagation(self):
+        """Stop the background propagation worker."""
+        if self.worker_poll_after is not None:
+            try:
+                self.after_cancel(self.worker_poll_after)
+            except Exception:
+                pass
+            self.worker_poll_after = None
+
+        if self.worker_stop_event:
+            self.worker_stop_event.set()
+
+        worker = self.worker_thread
+        if worker and worker.is_alive():
+            worker.join(timeout=0.5)
+
+        self.worker_thread = None
+        self.worker_stop_event = None
+        if self.worker_queue is not None:
+            try:
+                while True:
+                    self.worker_queue.get_nowait()
+            except queue.Empty:
+                pass
+        self.worker_queue = None
+
+        if self.auto_running:
+            propagation_logger.debug("Auto-propagation interrompue.")
+        self.auto_running = False
+
+    def apply_analysis_result(self, analysis: Optional[Dict[str, object]]):
+        """Store and display the latest analysis snapshot."""
+        if analysis is None:
+            analysis = {}
+
+        self.analysis = analysis
+
+        overlay = analysis.get("overlay")
+        if overlay is not None:
+            self.analysis_display = overlay
+        else:
+            self.analysis_display = draw_roi_overlay(
+                self.base_image,
+                self.app.puzzle_calibration.outer_roi,
+                self.app.puzzle_calibration.inner_roi,
+            )
+
+        now = time.perf_counter()
+        frame_dt = None
+        fps_value = None
+        if self.last_frame_time is not None and now > self.last_frame_time:
+            frame_dt = now - self.last_frame_time
+            fps_value = 1.0 / max(1e-6, frame_dt)
+            self.fps_label.config(text=f"FPS : {fps_value:.1f}")
+        else:
+            self.fps_label.config(text="FPS : idle")
+
+        if frame_dt is not None and propagation_logger.isEnabledFor(logging.DEBUG):
+            propagation_logger.debug("Frame rendu en %.4fs (FPS ~%.1f)", frame_dt, fps_value or 0.0)
+
+        self.last_frame_time = now
+
+        mean_color = analysis.get("mean_color")
+        if mean_color:
+            self.app.puzzle_calibration.background_sample = mean_color
+            self.canvas.background_sample = mean_color
+            self.status_display.update_background(mean_color)
+
+        self.update_summary_from_analysis()
+        self.update_step_controls()
+        self.update_debug_controls()
+        self.render_display()
+        if propagation_logger.isEnabledFor(logging.DEBUG):
+            propagation_logger.debug(
+                "Snapshot: processed=%d frontier=%d pending=%d active=%d frozen=%d loops=%d fps=%s",
+                analysis.get("processed_pixels", 0),
+                analysis.get("frontier_count", 0),
+                analysis.get("pending_count", 0),
+                analysis.get("active_count", 0),
+                analysis.get("frozen_count", 0),
+                analysis.get("loops_completed", 0),
+                f"{fps_value:.1f}" if fps_value is not None else "idle",
+            )
+
+    def update_summary_from_analysis(self):
+        """Refresh UI labels based on the current analysis state."""
+        analysis = self.analysis or {}
+        status = analysis.get("status")
+
+        if status != "ok":
+            if status == "missing_rois":
+                self.summary_label.config(
+                    text="Sélectionnez les deux zones (bord puis intérieur) pour lancer la propagation."
+                )
+            else:
+                self.summary_label.config(text="Propagation indisponible pour cette configuration.")
+            self.stop_auto_propagation()
+            self.fps_label.config(text="FPS : —")
+            self.grid_label.config(text="")
+            self.btn_next.state(["disabled"])
+            return
+
+        complete = analysis.get("complete", False)
+        loops = analysis.get("loops_completed", 0)
+        active = analysis.get("active_count", 0)
+        frozen = analysis.get("frozen_count", 0)
+        processed = analysis.get("processed_pixels", 0)
+        frontier = analysis.get("frontier_count", 0)
+        pending = analysis.get("pending_count", 0)
+
+        if complete:
+            loop_text = "1 boucle" if loops == 1 else f"{loops} boucles"
+            self.summary_label.config(
+                text=f"Propagation terminée ({loop_text}). Pixels figés : {frozen}."
+            )
+            self.stop_auto_propagation()
+            self.btn_next.state(["!disabled"])
+        else:
+            self.summary_label.config(
+                text=f"Propagation en cours · boucle #{loops + 1}. Pixels actifs : {active}."
+            )
+            self.btn_next.state(["disabled"])
+
+        color = analysis.get("mean_color")
+        color_text = ""
+        if color:
+            color_text = f"\nCouleur moyenne : RGB({color[2]}, {color[1]}, {color[0]})."
+
+        self.grid_label.config(
+            text=(
+                f"Pixels traités : {processed} · Front actif : {frontier}"
+                f" · En attente : {pending}{color_text}"
+            )
+        )
+
+    def step_one_pixel(self):
+        """Advance the propagation by a single pixel."""
+        if (
+            not self.step_mode_var.get()
+            or not self.analysis
+            or self.analysis.get("status") != "ok"
+            or self.analysis.get("complete", False)
+        ):
+            return
+
+        self.stop_auto_propagation()
+        analysis = self.app.hole_analyzer.advance_pixels(1)
+        self.apply_analysis_result(analysis)
+
+    def step_one_loop(self):
+        """Advance the propagation by one full loop."""
+        if (
+            not self.step_mode_var.get()
+            or not self.analysis
+            or self.analysis.get("status") != "ok"
+            or self.analysis.get("complete", False)
+        ):
+            return
+
+        self.stop_auto_propagation()
+        analysis = self.app.hole_analyzer.advance_loop()
+        self.apply_analysis_result(analysis)
+
     def run_analysis(self):
         if self.base_image is None:
             return
 
+        self.stop_auto_propagation()
+        if self.param_update_after is not None:
+            try:
+                self.after_cancel(self.param_update_after)
+            except Exception:
+                pass
+            self.param_update_after = None
+
         outer = self.app.puzzle_calibration.outer_roi
         inner = self.app.puzzle_calibration.inner_roi
 
-        if outer and inner:
-            self.btn_refresh.state(["!disabled"])
-        else:
+        if not outer or not inner:
             self.btn_refresh.state(["disabled"])
-
-        self.analysis_display = draw_roi_overlay(self.base_image, outer, inner)
-        self.analysis = {}
-
-        if outer and inner:
-            analysis = self.app.hole_analyzer.analyze(self.base_image, outer, inner)
-            self.analysis = analysis
-            grid_text = ""
-            if analysis.get("status") == "ok" and analysis.get("grid_cells"):
-                grid_overlay = draw_grid_overlay(
-                    self.base_image,
-                    analysis["grid_cells"],
-                    analysis["grid_lines"]["vertical"],
-                    analysis["grid_lines"]["horizontal"],
-                )
-                self.analysis_display = draw_roi_overlay(grid_overlay, outer, inner)
-
-                cols = len(analysis["grid_lines"]["vertical"]) - 1
-                rows = len(analysis["grid_lines"]["horizontal"]) - 1
-                self.summary_label.config(
-                    text=f"Grille estimée : {cols} × {rows} ({analysis['missing_count']} emplacements)."
-                )
-                grid_text = "Contours et grille recalculés."
-                self.btn_next.state(["!disabled"])
-            else:
-                self.summary_label.config(
-                    text="Analyse effectuée mais aucune grille claire n'a été trouvée. Ajustez les zones."
-                )
-                grid_text = "Essayez d'élargir la zone externe ou de repositionner la zone interne."
-                self.btn_next.state(["disabled"])
-
-            color_sample = analysis.get("mean_color")
-            if color_sample:
-                self.app.puzzle_calibration.background_sample = color_sample
-                self.canvas.background_sample = color_sample
-                self.status_display.update_background(color_sample)
-                r, g, b = color_sample[2], color_sample[1], color_sample[0]
-                if grid_text:
-                    grid_text += "\n"
-                grid_text += f"Couleur moyenne : RGB({r}, {g}, {b})."
-
-            self.grid_label.config(text=grid_text)
-
-            self.update_debug_controls()
-        else:
+            self.analysis = {}
+            self.analysis_display = draw_roi_overlay(self.base_image, outer, inner)
             self.summary_label.config(
-                text="Sélectionnez les deux zones (bord extérieur puis zone interne) pour lancer l'analyse."
+                text="Sélectionnez les deux zones (bord puis intérieur) pour lancer la propagation."
             )
             self.grid_label.config(text="")
+            self.fps_label.config(text="FPS : —")
             self.btn_next.state(["disabled"])
+            self.update_step_controls()
+            self.update_debug_controls()
+            self.render_display()
+            return
+
+        self.btn_refresh.state(["!disabled"])
+
+        blur_kernel = self.get_blur_kernel()
+        canny_low, canny_high = self.get_canny_thresholds()
+        self.auto_pixels_budget = float(self.AUTO_PIXELS_PER_FRAME)
+        self.auto_chunk_size = float(self.AUTO_CHUNK_SIZE)
+        propagation_logger.info(
+            "Analyse lancée (blur=%d, canny=(%d,%d), outer=%s, inner=%s).",
+            blur_kernel,
+            canny_low,
+            canny_high,
+            outer,
+            inner,
+        )
+
+        analysis = self.app.hole_analyzer.prepare(
+            self.base_image, outer, inner, blur_kernel, canny_low, canny_high
+        )
+        if analysis.get("status") != "ok":
+            propagation_logger.warning("Analyse échouée (statut=%s).", analysis.get("status"))
+            self.apply_analysis_result(analysis)
+            return
+
+        self.apply_analysis_result(analysis)
 
         if self.detected_pieces is not None:
             self.pieces_label.config(
@@ -490,7 +1447,8 @@ class Step1Frame(tk.Frame):
                 fg=PALETTE["accent"] if self.detected_pieces else PALETTE["muted"],
             )
 
-        self.render_display()
+        if not self.step_mode_var.get():
+            self.start_auto_propagation()
 
     def render_display(self):
         if self.base_image is None:
@@ -729,22 +1687,46 @@ class Step2Frame(tk.Frame):
         if not paths:
             return
 
-        self.app.pieces_image_paths = list(paths)
+        self._configure_piece_images(list(paths), silent=False)
+
+    def _configure_piece_images(self, paths: List[str], *, silent: bool) -> bool:
+        """Apply loaded piece images and refresh the UI."""
+        if not paths:
+            return False
+
+        first_img = None
+        resolved_first_path: Optional[str] = None
+        for candidate in _candidate_paths(paths[0]):
+            first_img = cv2.imread(str(candidate))
+            if first_img is not None:
+                resolved_first_path = str(candidate)
+                break
+
+        if first_img is None or resolved_first_path is None:
+            logger.error("Impossible de charger la première image de pièces %s", paths[0])
+            if not silent:
+                messagebox.showerror("Octopuzzle", "Impossible de charger la première image.")
+            return False
+
+        resolved_paths: List[str] = [resolved_first_path]
+        for raw_path in paths[1:]:
+            existing = find_existing_path(raw_path)
+            if existing:
+                resolved_paths.append(str(existing))
+            else:
+                resolved_paths.append(str(Path(raw_path)))
+
+        self.app.pieces_image_paths = resolved_paths
         self.current_image_index = 0
 
-        image_names = [f"Image {i+1}" for i in range(len(paths))]
+        image_names = [f"Image {i+1}" for i in range(len(resolved_paths))]
         self.image_selector["values"] = image_names
         if image_names:
             self.image_selector.current(0)
 
-        first_img = cv2.imread(paths[0])
-        if first_img is None:
-            messagebox.showerror("Octopuzzle", "Impossible de charger la première image.")
-            return
-
         self.canvas.load_image(first_img)
         self.status_label.config(
-            text=f"{len(paths)} images chargées. Ajustez la calibration si nécessaire."
+            text=f"{len(resolved_paths)} images chargées. Ajustez la calibration si nécessaire."
         )
 
         self.canvas.roi = None
@@ -761,13 +1743,14 @@ class Step2Frame(tk.Frame):
         self.status_display.update_roi(None)
         self.status_display.update_background(None)
         self.check_ready()
+        return True
 
     def on_image_changed(self, event):
         """Handle image selection change."""
         self.current_image_index = self.image_selector.current()
         if 0 <= self.current_image_index < len(self.app.pieces_image_paths):
             path = self.app.pieces_image_paths[self.current_image_index]
-            img = cv2.imread(path)
+            img = cv2.imread(str(path))
             if img is not None:
                 if self.debug_var.get():
                     self.preview_detection()
@@ -819,7 +1802,7 @@ class Step2Frame(tk.Frame):
             if self.app.pieces_image_paths and 0 <= self.current_image_index < len(
                 self.app.pieces_image_paths
             ):
-                img = cv2.imread(self.app.pieces_image_paths[self.current_image_index])
+                img = cv2.imread(str(self.app.pieces_image_paths[self.current_image_index]))
                 if img is not None:
                     self.canvas.load_image(img)
                     if self.canvas.roi:
@@ -836,7 +1819,7 @@ class Step2Frame(tk.Frame):
         self.app.pieces_calibration.max_area = self.max_area_var.get()
 
         detector = PuzzlePieceDetector(self.app.pieces_calibration)
-        current_path = self.app.pieces_image_paths[self.current_image_index]
+        current_path = str(self.app.pieces_image_paths[self.current_image_index])
         pieces, debug_img = detector.detect_with_debug(current_path)
 
         if debug_img is not None:
@@ -844,6 +1827,58 @@ class Step2Frame(tk.Frame):
             self.status_label.config(
                 text=f"{len(pieces)} pièces détectées dans l'image sélectionnée."
             )
+
+    def export_state(self) -> Dict[str, Any]:
+        """Return the calibration state for available pieces."""
+        images = [
+            value
+            for value in (_serialise_path(path) for path in self.app.pieces_image_paths)
+            if value
+        ]
+        return {
+            "images": images,
+            "roi": _roi_to_list(self.app.pieces_calibration.roi),
+            "background_sample": _color_to_list(self.app.pieces_calibration.background_sample),
+            "min_area": int(self.min_area_var.get()),
+            "max_area": int(self.max_area_var.get()),
+        }
+
+    def apply_state(self, state: Optional[Dict[str, Any]]) -> None:
+        """Restore calibration for the pieces step."""
+        if not state:
+            return
+
+        images_raw = [str(p) for p in (state.get("images") or []) if p]
+        if images_raw:
+            loaded = self._configure_piece_images(images_raw, silent=True)
+            if not loaded:
+                logger.warning("Impossible de recharger les images de pièces depuis la session.")
+
+        if "min_area" in state:
+            value = int(state["min_area"])
+            self.min_area_var.set(value)
+            self.app.pieces_calibration.min_area = value
+        if "max_area" in state:
+            value = int(state["max_area"])
+            self.max_area_var.set(value)
+            self.app.pieces_calibration.max_area = value
+
+        if not self.app.pieces_image_paths:
+            return
+
+        roi = _tuple_from_sequence(state.get("roi"))
+        if roi:
+            self.canvas.roi = roi
+            self.on_roi_selected(roi)
+
+        bg = _color_from_sequence(state.get("background_sample"))
+        if bg:
+            self.canvas.background_sample = bg
+            self.on_background_selected(bg)
+
+    def apply_cli_overrides(self, args: argparse.Namespace) -> None:
+        """Currently unused placeholder for CLI overrides on step 2."""
+        _ = args  # Placeholder to avoid unused warnings.
 
     def check_ready(self):
         """Check if ready to proceed."""
@@ -1014,9 +2049,74 @@ class Step3Frame(tk.Frame):
         self.stats_bar.update_stats(placed, total)
 
 
-def main():
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Assistant Octopuzzle")
+    parser.add_argument("--hole-image", type=Path, help="Chemin de l'image du trou à charger au démarrage.")
+    parser.add_argument(
+        "--outer-roi",
+        type=parse_roi,
+        help="Coordonnées x,y,w,h de la zone extérieure (calibration trou).",
+    )
+    parser.add_argument(
+        "--inner-roi",
+        type=parse_roi,
+        help="Coordonnées x,y,w,h de la zone intérieure (calibration trou).",
+    )
+    parser.add_argument("--blur-kernel", type=int, help="Taille du noyau de flou gaussien (impair).")
+    parser.add_argument("--canny-low", type=int, help="Seuil bas de Canny.")
+    parser.add_argument("--canny-high", type=int, help="Seuil haut de Canny.")
+    parser.add_argument("--min-area", type=int, help="Surface minimale pour la détection de pièces.")
+    parser.add_argument("--max-area", type=int, help="Surface maximale pour la détection de pièces.")
+    parser.add_argument("--load-session", type=Path, help="Charger un fichier de session JSON existant.")
+    parser.add_argument("--save-session", type=Path, help="Enregistrer la session à la fermeture.")
+    parser.add_argument(
+        "--log-level",
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Niveau global des logs (par défaut WARNING).",
+    )
+    parser.add_argument("--log-file", type=Path, help="Chemin d'un fichier où écrire les logs.")
+    parser.add_argument(
+        "--log-propagation",
+        action="store_true",
+        help="Active les logs détaillés de la propagation du trou.",
+    )
+    return parser.parse_args(argv)
+
+
+def configure_logging(args: argparse.Namespace) -> None:
+    """Configure logging according to CLI options."""
+    level_name = getattr(args, "log_level", "INFO")
+    level = getattr(logging, level_name.upper(), logging.INFO)
+
+    handlers: List[logging.Handler] = []
+
+    log_file = getattr(args, "log_file", None)
+    if log_file:
+        log_path = Path(log_file)
+        if log_path.parent and not log_path.parent.exists():
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path, encoding="utf-8"))
+
+    handlers.append(logging.StreamHandler())
+
+    logging.basicConfig(
+        level=level,
+        handlers=handlers,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
+    )
+
+    if getattr(args, "log_propagation", False):
+        logging.getLogger("octopuzzle.propagation").setLevel(logging.DEBUG)
+
+
+def main(argv: Optional[List[str]] = None):
     """Run the application"""
-    app = OctopuzzleApp()
+    args = parse_args(argv)
+    configure_logging(args)
+    app = OctopuzzleApp(args)
     app.mainloop()
 
 

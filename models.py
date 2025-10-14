@@ -3,12 +3,18 @@ Octopuzzle - Data Models and Business Logic
 Contains: CalibrationData, PuzzlePiece, Detector, Matcher, Solver
 """
 
-import cv2
-import numpy as np
-import math
+import logging
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import List, Tuple, Optional, Dict
-from collections import defaultdict
+
+import cv2
+import numpy as np
+
+logger = logging.getLogger("octopuzzle.propagation")
+
+ACTIVE_COLOR = np.array([60, 60, 255], dtype=np.uint8)
+FROZEN_COLOR = np.array([212, 190, 6], dtype=np.uint8)
 
 
 @dataclass
@@ -290,210 +296,433 @@ class PuzzlePieceDetector:
 
 
 class HoleAnalyzer:
-    """Analyse the puzzle hole to detect borders and estimate the missing grid."""
+    """Simple mask-based propagation from the inner ROI towards the outer ROI."""
 
-    def __init__(self, canny_low=60, canny_high=160):
-        self.canny_low = canny_low
-        self.canny_high = canny_high
+    def __init__(self):
+        self.state: Optional[Dict[str, object]] = None
+        self.debug_enabled = False
 
-    @staticmethod
-    def _cluster_positions(values: List[float], tolerance: float) -> List[int]:
-        if not values:
-            return []
-        values = sorted(values)
-        clusters: List[Tuple[float, int]] = []  # (mean, count)
-        for val in values:
-            if not clusters or abs(val - clusters[-1][0]) > tolerance:
-                clusters.append([val, 1])
-            else:
-                mean, count = clusters[-1]
-                new_count = count + 1
-                new_mean = (mean * count + val) / new_count
-                clusters[-1] = [new_mean, new_count]
-        return [int(round(mean)) for mean, _ in clusters]
+    def reset(self) -> None:
+        """Clear any previous analysis state."""
+        self.state = None
 
-    def analyze(self, image: np.ndarray, outer_roi: Optional[Tuple[int, int, int, int]],
-                inner_roi: Optional[Tuple[int, int, int, int]]) -> Dict[str, object]:
-        result: Dict[str, object] = {
-            "status": "missing_rois",
-            "grid_cells": [],
-            "grid_lines": {"vertical": [], "horizontal": []},
-            "missing_count": 0,
-            "debug_layers": {},
-            "border_contour": None,
-        }
+    def set_debug(self, enabled: bool) -> None:
+        """Enable or disable building of debug layers."""
+        self.debug_enabled = bool(enabled)
+
+    def prepare(
+        self,
+        image: np.ndarray,
+        outer_roi: Optional[Tuple[int, int, int, int]],
+        inner_roi: Optional[Tuple[int, int, int, int]],
+        blur_kernel: int = 5,
+        canny_low: int = 45,
+        canny_high: int = 110,
+    ) -> Dict[str, object]:
+        """Initialise the propagation state and return the first snapshot."""
+        self.reset()
+        base_result = self._empty_result("missing_rois")
 
         if image is None or outer_roi is None or inner_roi is None:
-            return result
+            return base_result
 
         x_outer, y_outer, w_outer, h_outer = outer_roi
         x_inner, y_inner, w_inner, h_inner = inner_roi
 
+        # Clamp the inner ROI to the outer ROI bounds.
         x_inner = max(x_outer, x_inner)
         y_inner = max(y_outer, y_inner)
-        w_inner = min(w_inner, (x_outer + w_outer) - x_inner)
-        h_inner = min(h_inner, (y_outer + h_outer) - y_inner)
+        right_outer = x_outer + w_outer
+        bottom_outer = y_outer + h_outer
+        w_inner = min(w_inner, right_outer - x_inner)
+        h_inner = min(h_inner, bottom_outer - y_inner)
         if w_inner <= 0 or h_inner <= 0:
-            return result
+            return base_result
 
-        outer_crop = image[y_outer : y_outer + h_outer, x_outer : x_outer + w_outer]
-        if outer_crop.size == 0:
-            return result
+        h_img, w_img = image.shape[:2]
+        if w_img == 0 or h_img == 0:
+            return base_result
 
-        inner_rel = (x_inner - x_outer, y_inner - y_outer, w_inner, h_inner)
+        kernel = max(1, int(blur_kernel))
+        if kernel % 2 == 0:
+            kernel += 1
 
-        gray_outer = cv2.cvtColor(outer_crop, cv2.COLOR_BGR2GRAY)
-        blur_outer = cv2.GaussianBlur(gray_outer, (5, 5), 0)
-        outer_mean, outer_std = cv2.meanStdDev(blur_outer)
-        outer_sigma = float(outer_std[0][0])
-        low_outer = int(max(20, min(120, outer_sigma * 0.75 + 20)))
-        high_outer = int(max(low_outer + 40, min(240, outer_sigma * 1.75 + 60)))
-        edges_outer = cv2.Canny(blur_outer, low_outer, high_outer)
+        canny_low = max(0, int(canny_low))
+        canny_high = max(canny_low + 1, int(canny_high))
 
-        ring_mask = np.zeros_like(edges_outer)
-        cv2.rectangle(ring_mask, (0, 0), (w_outer - 1, h_outer - 1), 255, thickness=-1)
-        cv2.rectangle(
-            ring_mask,
-            (inner_rel[0], inner_rel[1]),
-            (inner_rel[0] + inner_rel[2], inner_rel[1] + inner_rel[3]),
-            0,
-            thickness=-1,
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if kernel > 1:
+            blurred_gray = cv2.GaussianBlur(gray, (kernel, kernel), 0)
+            blurred_color = cv2.GaussianBlur(image, (kernel, kernel), 0)
+        else:
+            blurred_gray = gray.copy()
+            blurred_color = image.copy()
+
+        edges = cv2.Canny(blurred_gray, canny_low, canny_high)
+        mask = np.zeros((h_img, w_img), dtype=np.uint8)
+        interior_mask = np.zeros((h_img, w_img), dtype=bool)
+
+        # Mark the inner ROI interior so we never expand inward.
+        if w_inner > 2 and h_inner > 2:
+            interior_mask[
+                y_inner + 1 : y_inner + h_inner - 1, x_inner + 1 : x_inner + w_inner - 1
+            ] = True
+        edges[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner] = 0
+
+        border_pixels = set()
+        # Horizontal borders
+        for xs in range(x_inner, x_inner + w_inner):
+            mask[y_inner, xs] = 1
+            border_pixels.add((y_inner, xs))
+            edges[y_inner, xs] = 0
+            if h_inner > 1:
+                y_bottom = y_inner + h_inner - 1
+                mask[y_bottom, xs] = 1
+                border_pixels.add((y_bottom, xs))
+                edges[y_bottom, xs] = 0
+
+        # Vertical borders
+        for ys in range(y_inner, y_inner + h_inner):
+            mask[ys, x_inner] = 1
+            border_pixels.add((ys, x_inner))
+            edges[ys, x_inner] = 0
+            if w_inner > 1:
+                x_right = x_inner + w_inner - 1
+                mask[ys, x_right] = 1
+                border_pixels.add((ys, x_right))
+                edges[ys, x_right] = 0
+
+        frontier = deque(sorted(border_pixels))
+        complete = len(frontier) == 0
+        active_count = len(frontier)
+
+        mean_color = tuple(
+            int(c)
+            for c in cv2.mean(image[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner])[:3]
         )
 
-        border_edges = cv2.bitwise_and(edges_outer, edges_outer, mask=ring_mask)
-        kernel = np.ones((3, 3), np.uint8)
-        border_edges_clean = cv2.morphologyEx(border_edges, cv2.MORPH_CLOSE, kernel, iterations=2)
+        overlay = image.copy()
+        overlay[mask == 1] = ACTIVE_COLOR
 
-        contours, _ = cv2.findContours(border_edges_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        border_contour_abs = None
-        if contours:
-            main_contour = max(contours, key=lambda c: cv2.arcLength(c, True))
-            border_contour_abs = main_contour + np.array([[[x_outer, y_outer]]])
+        self.state = {
+            "image": image,
+            "outer_bounds": (x_outer, y_outer, right_outer, bottom_outer),
+            "inner_roi": (x_inner, y_inner, w_inner, h_inner),
+            "mask": mask,
+            "interior_mask": interior_mask,
+            "frontier": frontier,
+            "next_frontier": deque(),
+            "loop_remaining": len(frontier),
+            "loops_completed": 0,
+            "processed_pixels": 0,
+            "complete": complete,
+            "active_count": active_count,
+            "frozen_count": 0,
+            "blur_kernel": kernel,
+            "edges": edges,
+            "blurred_color": blurred_color,
+            "mean_color": mean_color,
+            "canny_low": canny_low,
+            "canny_high": canny_high,
+            "overlay_cache": overlay,
+        }
 
-        inner_crop = image[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner]
-        inner_gray = cv2.cvtColor(inner_crop, cv2.COLOR_BGR2GRAY)
-        inner_blur = cv2.GaussianBlur(inner_gray, (5, 5), 0)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "Propagation initialisée (inner=%s outer=%s frontier=%d mean_color=%s)",
+                (x_inner, y_inner, w_inner, h_inner),
+                outer_roi,
+                len(frontier),
+                mean_color,
+            )
 
-        _, inner_std = cv2.meanStdDev(inner_blur)
-        sigma_inner = float(inner_std[0][0])
-        low_inner = int(max(12, min(110, sigma_inner * 1.2 + 15)))
-        high_inner = int(max(low_inner + 30, min(220, sigma_inner * 2.3 + 45)))
-        edges_inner = cv2.Canny(inner_blur, low_inner, high_inner)
+        return self._build_result(status="ok")
 
-        mean_inner = float(cv2.mean(inner_blur)[0])
-        shadow_threshold = max(0, mean_inner - sigma_inner * 0.8 - 5)
-        _, shadow_mask = cv2.threshold(inner_blur, shadow_threshold, 255, cv2.THRESH_BINARY_INV)
-        edges_inner = cv2.bitwise_and(edges_inner, edges_inner, mask=shadow_mask.astype(np.uint8))
-        edges_inner = cv2.morphologyEx(edges_inner, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8), iterations=1)
-        edges_inner = cv2.morphologyEx(edges_inner, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8), iterations=1)
+    def advance_pixels(self, count: int = 1) -> Dict[str, object]:
+        """Advance the propagation by a fixed number of pixels."""
+        if not self.state or count <= 0:
+            return self._build_result()
 
-        inner_color_mean = tuple(int(c) for c in cv2.mean(inner_crop)[:3])
-        result["mean_color"] = inner_color_mean
+        while count > 0 and not self.state["complete"]:
+            if not self._ensure_frontier_ready():
+                break
+            if not self.state["frontier"]:
+                break
 
-        min_line_length = max(20, min(w_inner, h_inner) // 3)
-        lines = cv2.HoughLinesP(
-            edges_inner,
-            rho=1,
-            theta=np.pi / 180,
-            threshold=60,
-            minLineLength=min_line_length,
-            maxLineGap=20,
-        )
+            y, x = self.state["frontier"].popleft()
+            if self.state["mask"][y, x] != 1:
+                continue
 
-        vertical_positions: List[float] = []
-        horizontal_positions: List[float] = []
-        if lines is not None:
-            for x1, y1, x2, y2 in lines[:, 0]:
-                dx = x2 - x1
-                dy = y2 - y1
-                if dx == 0 and dy == 0:
+            self.state["loop_remaining"] = max(0, self.state["loop_remaining"] - 1)
+            self._process_pixel(y, x)
+            self.state["processed_pixels"] += 1
+            count -= 1
+
+            if self.state["loop_remaining"] == 0:
+                self._start_next_loop()
+
+        if logger.isEnabledFor(logging.DEBUG) and self.state:
+            logger.debug(
+                "advance_pixels terminé: processed=%d frontier=%d pending=%d loops=%d complete=%s",
+                self.state["processed_pixels"],
+                len(self.state["frontier"]),
+                len(self.state["next_frontier"]),
+                self.state["loops_completed"],
+                self.state["complete"],
+            )
+        return self._build_result()
+
+    def advance_loop(self) -> Dict[str, object]:
+        """Process the current frontier (one full loop)."""
+        if not self.state or self.state["complete"]:
+            return self._build_result()
+
+        if not self._ensure_frontier_ready():
+            return self._build_result()
+
+        iterations = self.state["loop_remaining"]
+        for _ in range(iterations):
+            if not self.state["frontier"]:
+                break
+
+            y, x = self.state["frontier"].popleft()
+            if self.state["mask"][y, x] != 1:
+                continue
+
+            self.state["loop_remaining"] = max(0, self.state["loop_remaining"] - 1)
+            self._process_pixel(y, x)
+            self.state["processed_pixels"] += 1
+
+        self._start_next_loop()
+        if logger.isEnabledFor(logging.DEBUG) and self.state:
+            logger.debug(
+                "advance_loop terminé: processed=%d frontier=%d pending=%d loops=%d complete=%s",
+                self.state["processed_pixels"],
+                len(self.state["frontier"]),
+                len(self.state["next_frontier"]),
+                self.state["loops_completed"],
+                self.state["complete"],
+            )
+        return self._build_result()
+
+    def run_to_completion(self, max_loops: Optional[int] = None) -> Dict[str, object]:
+        """Run the propagation until no active pixels remain."""
+        if not self.state:
+            return self._build_result()
+
+        loops_done = 0
+        while not self.state["complete"]:
+            self.advance_loop()
+            loops_done += 1
+            if max_loops is not None and loops_done >= max_loops:
+                break
+
+        return self._build_result()
+
+    def get_result(self) -> Dict[str, object]:
+        """Return the current analysis result."""
+        return self._build_result()
+
+    # --------------------------------------------------------------------- #
+    # Internal helpers
+    # --------------------------------------------------------------------- #
+
+    def _ensure_frontier_ready(self) -> bool:
+        """Ensure there is a frontier to process."""
+        if not self.state:
+            return False
+
+        while self.state["frontier"] and self.state["mask"][self.state["frontier"][0][0], self.state["frontier"][0][1]] != 1:
+            self.state["frontier"].popleft()
+
+        if self.state["frontier"]:
+            if self.state["loop_remaining"] == 0:
+                self.state["loop_remaining"] = len(self.state["frontier"])
+            return True
+
+        if self.state["next_frontier"]:
+            self._start_next_loop()
+            return not self.state["complete"]
+
+        self.state["complete"] = True
+        self.state["loop_remaining"] = 0
+        return False
+
+    def _start_next_loop(self) -> None:
+        """Promote the next frontier or mark completion."""
+        if not self.state:
+            return
+
+        while self.state["frontier"] and self.state["mask"][self.state["frontier"][0][0], self.state["frontier"][0][1]] != 1:
+            self.state["frontier"].popleft()
+
+        if self.state["frontier"] and self.state["loop_remaining"] > 0:
+            return
+
+        if self.state["next_frontier"]:
+            self.state["frontier"] = self.state["next_frontier"]
+            self.state["next_frontier"] = deque()
+            self.state["loop_remaining"] = len(self.state["frontier"])
+            self.state["loops_completed"] += 1
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Boucle suivante démarrée: loops=%d frontier=%d",
+                    self.state["loops_completed"],
+                    len(self.state["frontier"]),
+                )
+        else:
+            self.state["frontier"] = deque()
+            self.state["loop_remaining"] = 0
+            self.state["complete"] = True
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    "Propagation complétée après %d boucles.",
+                    self.state["loops_completed"],
+                )
+
+    def _process_pixel(self, y: int, x: int) -> None:
+        """Transition a single pixel from frontier to frozen and grow the mask outward."""
+        if not self.state:
+            return
+
+        mask = self.state["mask"]
+        edges = self.state["edges"]
+        outer_bounds = self.state["outer_bounds"]
+        interior = self.state["interior_mask"]
+
+        self.state["active_count"] = max(0, self.state["active_count"] - 1)
+
+        freeze_pixel = edges[y, x] > 0
+        neighbours = self._neighbours(y, x, outer_bounds)
+
+        for ny, nx in neighbours:
+            if interior[ny, nx]:
+                continue
+            if mask[ny, nx] == 2:
+                continue
+            if edges[ny, nx] > 0:
+                freeze_pixel = True
+                continue
+            if mask[ny, nx] == 0:
+                mask[ny, nx] = 1
+                self.state["next_frontier"].append((ny, nx))
+                self.state["active_count"] += 1
+
+        mask[y, x] = 2
+        self.state["frozen_count"] += 1
+        if freeze_pixel and not self.state["next_frontier"]:
+            for ny, nx in neighbours:
+                if interior[ny, nx] or mask[ny, nx] != 0:
                     continue
-                length = math.hypot(dx, dy)
-                if length < min_line_length:
-                    continue
-                angle = abs(math.degrees(math.atan2(dy, dx)))
-                if angle > 90:
-                    angle = 180 - angle
+                mask[ny, nx] = 1
+                self.state["next_frontier"].append((ny, nx))
+                self.state["active_count"] += 1
+                break
+        overlay = self.state["overlay_cache"]
+        overlay[y, x] = FROZEN_COLOR
 
-                if angle > 65:
-                    vertical_positions.append((x1 + x2) / 2.0)
-                elif angle < 25:
-                    horizontal_positions.append((y1 + y2) / 2.0)
+    @staticmethod
+    def _neighbours(y: int, x: int, bounds: Tuple[int, int, int, int]) -> List[Tuple[int, int]]:
+        x0, y0, x1, y1 = bounds
+        neighbours = []
+        if x > x0:
+            neighbours.append((y, x - 1))
+        if x + 1 < x1:
+            neighbours.append((y, x + 1))
+        if y > y0:
+            neighbours.append((y - 1, x))
+        if y + 1 < y1:
+            neighbours.append((y + 1, x))
+        return neighbours
 
-        vertical_lines_rel = [0, w_inner]
-        horizontal_lines_rel = [0, h_inner]
+    def _build_result(self, status: str = "ok") -> Dict[str, object]:
+        if not self.state:
+            return self._empty_result(status)
 
-        vertical_lines_rel.extend(self._cluster_positions(vertical_positions, tolerance=w_inner * 0.08))
-        horizontal_lines_rel.extend(self._cluster_positions(horizontal_positions, tolerance=h_inner * 0.08))
+        overlay = self._ensure_overlay()
 
-        vertical_lines_rel = sorted(set(int(round(v)) for v in vertical_lines_rel))
-        horizontal_lines_rel = sorted(set(int(round(v)) for v in horizontal_lines_rel))
+        active = int(self.state.get("active_count", 0))
+        frozen = int(self.state.get("frozen_count", 0))
 
-        if len(vertical_lines_rel) < 2:
-            vertical_lines_rel = [0, w_inner]
-        if len(horizontal_lines_rel) < 2:
-            horizontal_lines_rel = [0, h_inner]
+        debug_layers = self._build_debug_layers(overlay) if self.debug_enabled else {}
 
-        grid_cells: List[Tuple[int, int, int, int]] = []
-        for col in range(len(vertical_lines_rel) - 1):
-            x_start = vertical_lines_rel[col]
-            x_end = vertical_lines_rel[col + 1]
-            for row in range(len(horizontal_lines_rel) - 1):
-                y_start = horizontal_lines_rel[row]
-                y_end = horizontal_lines_rel[row + 1]
-                cell_x = x_inner + x_start
-                cell_y = y_inner + y_start
-                cell_w = max(1, x_end - x_start)
-                cell_h = max(1, y_end - y_start)
-                grid_cells.append((cell_x, cell_y, cell_w, cell_h))
+        return {
+            "status": status,
+            "overlay": overlay,
+            "mask": None,
+            "debug_layers": debug_layers,
+            "complete": self.state["complete"],
+            "loops_completed": self.state["loops_completed"],
+            "processed_pixels": self.state["processed_pixels"],
+            "loop_remaining": self.state["loop_remaining"],
+            "frontier_count": len(self.state["frontier"]),
+            "pending_count": len(self.state["next_frontier"]),
+            "active_count": active,
+            "frozen_count": frozen,
+            "blur_kernel": self.state["blur_kernel"],
+            "mean_color": self.state["mean_color"],
+            "canny_low": self.state["canny_low"],
+            "canny_high": self.state["canny_high"],
+        }
 
-        missing_count = len(grid_cells)
+    def _ensure_overlay(self) -> np.ndarray:
+        if not self.state:
+            return np.zeros((1, 1, 3), dtype=np.uint8)
+        return self.state["overlay_cache"]
 
-        debug_layers: Dict[str, np.ndarray] = {}
-        border_debug = image.copy()
-        if border_contour_abs is not None:
-            cv2.drawContours(border_debug, [border_contour_abs], -1, (0, 255, 255), 2, cv2.LINE_AA)
-        debug_layers["Contours (bord)"] = border_debug
+    def _build_debug_layers(self, overlay: np.ndarray) -> Dict[str, np.ndarray]:
+        if not self.debug_enabled or not self.state:
+            return {}
 
-        border_edges_color = cv2.cvtColor(border_edges_clean, cv2.COLOR_GRAY2BGR)
-        border_edges_canvas = np.zeros_like(image)
-        border_edges_canvas[y_outer : y_outer + h_outer, x_outer : x_outer + w_outer] = border_edges_color
-        debug_layers["Edges anneau"] = border_edges_canvas
+        debug: Dict[str, np.ndarray] = {}
+        debug["Masque (overlay)"] = overlay
 
-        inner_edges_color = cv2.cvtColor(edges_inner, cv2.COLOR_GRAY2BGR)
-        inner_edges_canvas = np.zeros_like(image)
-        inner_edges_canvas[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner] = inner_edges_color
-        debug_layers["Contours internes"] = inner_edges_canvas
+        state_map = self.state["image"].copy()
+        mask = self.state["mask"]
+        state_map[mask == 1] = (0, 0, 255)
+        state_map[mask == 2] = (212, 190, 6)
+        debug["Carte des états"] = state_map
 
-        shadow_canvas = np.zeros_like(image)
-        shadow_color = cv2.cvtColor(shadow_mask.astype(np.uint8), cv2.COLOR_GRAY2BGR)
-        shadow_canvas[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner] = shadow_color
-        debug_layers["Masque ombre"] = shadow_canvas
+        edges_vis = self.state["image"].copy()
+        edges_mask = self.state["edges"] > 0
+        edges_vis[edges_mask] = (0, 255, 255)
+        debug["Contours Canny (propagation)"] = edges_vis
 
-        grid_debug = image.copy()
-        for vx in vertical_lines_rel:
-            abs_x = x_inner + vx
-            cv2.line(grid_debug, (abs_x, y_inner), (abs_x, y_inner + h_inner), (99, 214, 255), 2, cv2.LINE_AA)
-        for vy in horizontal_lines_rel:
-            abs_y = y_inner + vy
-            cv2.line(grid_debug, (x_inner, abs_y), (x_inner + w_inner, abs_y), (99, 214, 255), 2, cv2.LINE_AA)
-        debug_layers["Grille estimée"] = grid_debug
+        blur_vis = self.state["blurred_color"].copy() if "blurred_color" in self.state else self.state["image"].copy()
+        x0, y0, x1, y1 = self.state["outer_bounds"]
+        base = self.state["image"]
+        if blur_vis.shape != base.shape:
+            blur_vis = base.copy()
+        else:
+            blur_vis = blur_vis.copy()
+        blur_vis[:y0, :] = base[:y0, :]
+        blur_vis[y1:, :] = base[y1:, :]
+        blur_vis[y0:y1, :x0] = base[y0:y1, :x0]
+        blur_vis[y0:y1, x1:] = base[y0:y1, x1:]
+        debug["Zone externe floutée"] = blur_vis
 
-        result.update(
-            {
-                "status": "ok",
-                "border_contour": border_contour_abs,
-                "grid_cells": grid_cells,
-                "grid_lines": {
-                    "vertical": [x_inner + int(v) for v in vertical_lines_rel],
-                    "horizontal": [y_inner + int(v) for v in horizontal_lines_rel],
-                },
-                "missing_count": missing_count,
-                "debug_layers": debug_layers,
-            }
-        )
+        return debug
 
-        return result
+    @staticmethod
+    def _empty_result(status: str) -> Dict[str, object]:
+        return {
+            "status": status,
+            "overlay": None,
+            "mask": None,
+            "debug_layers": {},
+            "complete": False,
+            "loops_completed": 0,
+            "processed_pixels": 0,
+            "loop_remaining": 0,
+            "frontier_count": 0,
+            "pending_count": 0,
+            "active_count": 0,
+            "frozen_count": 0,
+            "blur_kernel": None,
+            "mean_color": None,
+            "canny_low": None,
+            "canny_high": None,
+        }
 
 
 class PuzzleMatcher:

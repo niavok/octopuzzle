@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "hole": {
+    "image_path": "test/hole1.jpg",
+    "outer_roi": [
+      923,
+      1232,
+      1052,
+      1809
+    ],
+    "inner_roi": [
+      1145,
+      1767,
+      361,
+      955
+    ],
+    "blur_kernel": 11,
+    "canny_low": 45,
+    "canny_high": 110,
+    "min_area": 400,
+    "max_area": 50000
+  },
+  "pieces": {
+    "images": [],
+    "roi": null,
+    "background_sample": null,
+    "min_area": 500,
+    "max_area": 50000
+  }
+}
