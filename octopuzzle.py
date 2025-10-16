@@ -1735,13 +1735,13 @@ class Step1Frame(tk.Frame):
                 origin_x, origin_y, width, height = geometry
                 local_comp = composite[origin_y : origin_y + height, origin_x : origin_x + width]
                 local_state = state[origin_y : origin_y + height, origin_x : origin_x + width]
-                border_mask = mask == 1
-                if np.any(border_mask):
+                state_mask = mask >= 1
+                if np.any(state_mask):
                     blend = (
-                        0.4 * local_comp[border_mask].astype(np.float32)
-                        + 0.6 * local_state[border_mask].astype(np.float32)
+                        0.4 * local_comp[state_mask].astype(np.float32)
+                        + 0.6 * local_state[state_mask].astype(np.float32)
                     )
-                    local_comp[border_mask] = blend.astype(np.uint8)
+                    local_comp[state_mask] = blend.astype(np.uint8)
             elif state is not None:
                 composite = cv2.addWeighted(composite, 0.4, state, 0.6, 0)
 
