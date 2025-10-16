@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import cv2
+import numpy as np
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -361,6 +362,8 @@ class Step1Frame(tk.Frame):
         self.auto_pixels_budget = float(self.AUTO_PIXELS_PER_FRAME)
         self.auto_chunk_size = float(self.AUTO_CHUNK_SIZE)
         self._suspend_param_updates = 0
+        self.last_render_time = 0.0
+        self.force_render = True
 
         header_frame = tk.Frame(self, bg=PALETTE["background"])
         header_frame.pack(fill=tk.X, pady=(20, 8), padx=24)
@@ -371,7 +374,7 @@ class Step1Frame(tk.Frame):
 
         debug_frame = tk.Frame(header_frame, bg=PALETTE["background"])
         debug_frame.pack(side=tk.RIGHT)
-        self.debug_enabled = tk.BooleanVar(value=False)
+        self.debug_enabled = tk.BooleanVar(value=True)
         self.debug_toggle = ttk.Checkbutton(
             debug_frame,
             text="Mode debug",
@@ -380,6 +383,34 @@ class Step1Frame(tk.Frame):
             style=CHECKBUTTON_STYLE,
         )
         self.debug_toggle.pack(side=tk.LEFT, padx=(0, 8))
+
+        self.debug_options_frame = tk.Frame(debug_frame, bg=PALETTE["background"])
+        self.debug_state_var = tk.BooleanVar(value=True)
+        self.debug_canny_var = tk.BooleanVar(value=True)
+        self.debug_blur_var = tk.BooleanVar(value=False)
+        self.debug_state_cb = ttk.Checkbutton(
+            self.debug_options_frame,
+            text="État",
+            variable=self.debug_state_var,
+            command=self._on_debug_option_changed,
+            style=CHECKBUTTON_STYLE,
+        )
+        self.debug_canny_cb = ttk.Checkbutton(
+            self.debug_options_frame,
+            text="Contours",
+            variable=self.debug_canny_var,
+            command=self._on_debug_option_changed,
+            style=CHECKBUTTON_STYLE,
+        )
+        self.debug_blur_cb = ttk.Checkbutton(
+            self.debug_options_frame,
+            text="Flou",
+            variable=self.debug_blur_var,
+            command=self._on_debug_option_changed,
+            style=CHECKBUTTON_STYLE,
+        )
+        for cb in (self.debug_state_cb, self.debug_canny_cb, self.debug_blur_cb):
+            cb.pack(side=tk.LEFT, padx=2)
 
         self.fps_label = tk.Label(
             debug_frame,
@@ -464,9 +495,10 @@ class Step1Frame(tk.Frame):
 
         controls = self.controls_inner
         try:
-            self.app.hole_analyzer.set_debug(False)
+            self.app.hole_analyzer.set_debug(self.debug_enabled.get())
         except Exception:
             pass
+        self.update_debug_controls()
 
         tk.Label(
             controls,
@@ -577,6 +609,27 @@ class Step1Frame(tk.Frame):
         self.blur_kernel_var.trace_add("write", self.on_parameter_changed)
         self.canny_low_var.trace_add("write", self.on_parameter_changed)
         self.canny_high_var.trace_add("write", self.on_parameter_changed)
+
+        gap_frame = tk.Frame(controls, bg=PALETTE["panel"])
+        gap_frame.pack(fill=tk.X, padx=20, pady=(0, 12))
+        tk.Label(
+            gap_frame,
+            text="Passage minimal (px)",
+            font=("Segoe UI Semibold", 11),
+            bg=PALETTE["panel"],
+            fg=PALETTE["text"],
+        ).pack(anchor=tk.W, pady=(0, 4))
+        self.min_gap_var = tk.IntVar(value=5)
+        self.min_gap_input = ttk.Spinbox(
+            gap_frame,
+            from_=1,
+            to=50,
+            increment=1,
+            textvariable=self.min_gap_var,
+            width=6,
+        )
+        self.min_gap_input.pack(anchor=tk.W)
+        self.min_gap_var.trace_add("write", self.on_parameter_changed)
 
         tk.Label(
             controls,
@@ -882,6 +935,7 @@ class Step1Frame(tk.Frame):
             "canny_high": int(self.canny_high_var.get()),
             "min_area": int(self.min_area_var.get()),
             "max_area": int(self.max_area_var.get()),
+            "min_gap": int(self.min_gap_var.get()),
         }
 
     def apply_state(self, state: Optional[Dict[str, Any]]) -> None:
@@ -904,6 +958,8 @@ class Step1Frame(tk.Frame):
             self._set_var_safely(self.min_area_var, int(state["min_area"]))
         if "max_area" in state:
             self._set_var_safely(self.max_area_var, int(state["max_area"]))
+        if "min_gap" in state:
+            self._set_var_safely(self.min_gap_var, int(state["min_gap"]))
 
         if self.base_image is None:
             # Without image there is nothing else to restore.
@@ -947,6 +1003,8 @@ class Step1Frame(tk.Frame):
             self._set_var_safely(self.min_area_var, int(args.min_area))
         if getattr(args, "max_area", None) is not None:
             self._set_var_safely(self.max_area_var, int(args.max_area))
+        if getattr(args, "min_gap", None) is not None:
+            self._set_var_safely(self.min_gap_var, int(args.min_gap))
 
         if self.base_image is None:
             outer_roi = getattr(args, "outer_roi", None)
@@ -974,6 +1032,7 @@ class Step1Frame(tk.Frame):
         self.btn_select_inner.state(["!disabled"])
         self.btn_refresh.state(["!disabled"])
         self.canvas.set_mode("none")
+        self.force_render = True
         propagation_logger.info("ROI externe définie : %s", roi)
         self.run_analysis()
 
@@ -982,6 +1041,7 @@ class Step1Frame(tk.Frame):
         self.status_display.update_inner_roi(roi)
         self.summary_label.config(text="Zone interne définie. Analyse en cours...")
         self.canvas.set_mode("none")
+        self.force_render = True
         propagation_logger.info("ROI interne définie : %s", roi)
         self.run_analysis()
 
@@ -995,11 +1055,16 @@ class Step1Frame(tk.Frame):
         except Exception:
             propagation_logger.exception("Impossible de basculer le mode debug.")
         self.update_debug_controls()
+        self.force_render = True
         current = self.app.hole_analyzer.get_result()
         if current:
             self.apply_analysis_result(current)
         else:
             self.render_display()
+
+    def _on_debug_option_changed(self):
+        self.force_render = True
+        self.render_display()
 
     def _set_var_safely(self, var: tk.Variable, value: int) -> None:
         """Assign a tkinter variable without triggering parameter recomputation."""
@@ -1026,20 +1091,18 @@ class Step1Frame(tk.Frame):
         self._schedule_fps_idle()
 
     def update_debug_controls(self):
-        if self.debug_enabled.get() and self.analysis.get("debug_layers"):
-            layers = list(self.analysis["debug_layers"].keys())
-            ordered = [layer for layer in self.DEBUG_LAYERS_ORDER if layer in layers]
-            for layer in layers:
-                if layer not in ordered:
-                    ordered.append(layer)
-            self.debug_layer_combo["values"] = ordered
-            if self.debug_layer_var.get() not in ordered and ordered:
-                self.debug_layer_var.set(ordered[0])
-            if not self.debug_layer_combo.winfo_ismapped():
-                self.debug_layer_combo.pack(side=tk.LEFT)
+        if self.debug_enabled.get():
+            if not self.debug_options_frame.winfo_ismapped():
+                self.debug_options_frame.pack(side=tk.LEFT)
+            for cb in (self.debug_state_cb, self.debug_canny_cb, self.debug_blur_cb):
+                if not cb.winfo_ismapped():
+                    cb.pack(side=tk.LEFT, padx=2)
         else:
-            if self.debug_layer_combo.winfo_ismapped():
-                self.debug_layer_combo.pack_forget()
+            for cb in (self.debug_state_cb, self.debug_canny_cb, self.debug_blur_cb):
+                if cb.winfo_ismapped():
+                    cb.pack_forget()
+            if self.debug_options_frame.winfo_ismapped():
+                self.debug_options_frame.pack_forget()
 
     def get_blur_kernel(self) -> int:
         """Return a valid odd kernel size."""
@@ -1073,6 +1136,17 @@ class Step1Frame(tk.Frame):
         self._set_var_safely(self.canny_low_var, low)
         self._set_var_safely(self.canny_high_var, high)
         return low, high
+
+    def get_min_gap(self) -> int:
+        """Return the minimum passage width (pixels)."""
+        try:
+            gap = int(self.min_gap_var.get())
+        except Exception:
+            gap = 5
+            self._set_var_safely(self.min_gap_var, gap)
+        gap = max(1, gap)
+        self._set_var_safely(self.min_gap_var, gap)
+        return gap
 
     def on_parameter_changed(self, *_args):
         """Debounced hook to recompute the propagation when parameters change."""
@@ -1152,6 +1226,7 @@ class Step1Frame(tk.Frame):
             self.auto_chunk_size,
         )
         self.auto_running = True
+        self.force_render = True
         self.worker_queue = queue.Queue(maxsize=2)
         self.worker_stop_event = threading.Event()
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
@@ -1252,6 +1327,7 @@ class Step1Frame(tk.Frame):
         if self.auto_running:
             propagation_logger.debug("Auto-propagation interrompue.")
         self.auto_running = False
+        self.force_render = True
 
     def apply_analysis_result(self, analysis: Optional[Dict[str, object]]):
         """Store and display the latest analysis snapshot."""
@@ -1259,16 +1335,6 @@ class Step1Frame(tk.Frame):
             analysis = {}
 
         self.analysis = analysis
-
-        overlay = analysis.get("overlay")
-        if overlay is not None:
-            self.analysis_display = overlay
-        else:
-            self.analysis_display = draw_roi_overlay(
-                self.base_image,
-                self.app.puzzle_calibration.outer_roi,
-                self.app.puzzle_calibration.inner_roi,
-            )
 
         now = time.perf_counter()
         frame_dt = None
@@ -1294,7 +1360,25 @@ class Step1Frame(tk.Frame):
         self.update_summary_from_analysis()
         self.update_step_controls()
         self.update_debug_controls()
-        self.render_display()
+
+        overlay = analysis.get("overlay")
+        if overlay is not None:
+            self.analysis_display = overlay
+
+        should_render = self.force_render or not self.auto_running or analysis.get("complete", False)
+        if not should_render:
+            if self.last_render_time <= 0.0 or now - self.last_render_time >= 0.1:
+                should_render = True
+
+        display_img = None
+        if should_render:
+            display_img = self._build_display_image(analysis)
+            if display_img is not None:
+                self.analysis_display = display_img
+                self.canvas.show_image(display_img)
+                self.last_render_time = now
+                self.force_render = False
+
         if propagation_logger.isEnabledFor(logging.DEBUG):
             propagation_logger.debug(
                 "Snapshot: processed=%d frontier=%d pending=%d active=%d frozen=%d loops=%d fps=%s",
@@ -1397,6 +1481,8 @@ class Step1Frame(tk.Frame):
             except Exception:
                 pass
             self.param_update_after = None
+        self.force_render = True
+        self.last_render_time = 0.0
 
         outer = self.app.puzzle_calibration.outer_roi
         inner = self.app.puzzle_calibration.inner_roi
@@ -1420,19 +1506,21 @@ class Step1Frame(tk.Frame):
 
         blur_kernel = self.get_blur_kernel()
         canny_low, canny_high = self.get_canny_thresholds()
+        min_gap = self.get_min_gap()
         self.auto_pixels_budget = float(self.AUTO_PIXELS_PER_FRAME)
         self.auto_chunk_size = float(self.AUTO_CHUNK_SIZE)
         propagation_logger.info(
-            "Analyse lancée (blur=%d, canny=(%d,%d), outer=%s, inner=%s).",
+            "Analyse lancée (blur=%d, canny=(%d,%d), gap=%d, outer=%s, inner=%s).",
             blur_kernel,
             canny_low,
             canny_high,
+            min_gap,
             outer,
             inner,
         )
 
         analysis = self.app.hole_analyzer.prepare(
-            self.base_image, outer, inner, blur_kernel, canny_low, canny_high
+            self.base_image, outer, inner, blur_kernel, canny_low, canny_high, min_gap
         )
         if analysis.get("status") != "ok":
             propagation_logger.warning("Analyse échouée (statut=%s).", analysis.get("status"))
@@ -1453,23 +1541,69 @@ class Step1Frame(tk.Frame):
     def render_display(self):
         if self.base_image is None:
             return
+        display_img = self._build_display_image()
+        if display_img is None:
+            return
+        self.canvas.show_image(display_img)
+        self.analysis_display = display_img
+        self.last_render_time = time.perf_counter()
+        self.force_render = False
 
-        if self.debug_enabled.get() and self.analysis.get("debug_layers"):
-            layers = self.analysis["debug_layers"]
-            layer_name = self.debug_layer_var.get()
-            if layer_name not in layers and layers:
-                layer_name = next(iter(layers))
-                self.debug_layer_var.set(layer_name)
-            if layer_name in layers:
-                self.canvas.show_image(layers[layer_name])
-                return
-
-        img = self.analysis_display if self.analysis_display is not None else draw_roi_overlay(
+    def _build_display_image(self, analysis: Optional[Dict[str, object]] = None):
+        if self.base_image is None:
+            return None
+        analysis = analysis or self.analysis or {}
+        if self.debug_enabled.get():
+            debug_img = self._compose_debug_image()
+            if debug_img is not None:
+                return debug_img
+        overlay = analysis.get("overlay") if analysis else None
+        if overlay is not None:
+            return overlay
+        return draw_roi_overlay(
             self.base_image,
             self.app.puzzle_calibration.outer_roi,
             self.app.puzzle_calibration.inner_roi,
         )
-        self.canvas.show_image(img)
+
+    def _compose_debug_image(self) -> Optional[np.ndarray]:
+        if self.base_image is None:
+            return None
+        composite = self.base_image.copy()
+        analyzer = self.app.hole_analyzer
+        if not analyzer:
+            return composite
+
+        if self.debug_blur_var.get():
+            blur = analyzer.get_blur_image()
+            if blur is not None:
+                composite = cv2.addWeighted(composite, 0.5, blur, 0.5, 0)
+
+        if self.debug_canny_var.get():
+            edges = analyzer.get_edges_image()
+            if edges is not None:
+                mask = edges.any(axis=2)
+                composite[mask] = edges[mask]
+
+        if self.debug_state_var.get():
+            state = analyzer.get_state_overlay()
+            geometry = analyzer.get_roi_geometry()
+            mask = analyzer.get_mask()
+            if state is not None and geometry and mask is not None:
+                origin_x, origin_y, width, height = geometry
+                local_comp = composite[origin_y : origin_y + height, origin_x : origin_x + width]
+                local_state = state[origin_y : origin_y + height, origin_x : origin_x + width]
+                border_mask = mask == 1
+                if np.any(border_mask):
+                    blend = (
+                        0.4 * local_comp[border_mask].astype(np.float32)
+                        + 0.6 * local_state[border_mask].astype(np.float32)
+                    )
+                    local_comp[border_mask] = blend.astype(np.uint8)
+            elif state is not None:
+                composite = cv2.addWeighted(composite, 0.4, state, 0.6, 0)
+
+        return composite
 
     def next_step(self):
         if not self.app.puzzle_image_path:
@@ -2068,6 +2202,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--canny-high", type=int, help="Seuil haut de Canny.")
     parser.add_argument("--min-area", type=int, help="Surface minimale pour la détection de pièces.")
     parser.add_argument("--max-area", type=int, help="Surface maximale pour la détection de pièces.")
+    parser.add_argument("--min-gap", type=int, help="Largeur minimale (px) pour franchir un passage lors de la propagation.")
     parser.add_argument("--load-session", type=Path, help="Charger un fichier de session JSON existant.")
     parser.add_argument("--save-session", type=Path, help="Enregistrer la session à la fermeture.")
     parser.add_argument(

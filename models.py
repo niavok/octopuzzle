@@ -318,6 +318,7 @@ class HoleAnalyzer:
         blur_kernel: int = 5,
         canny_low: int = 45,
         canny_high: int = 110,
+        min_gap: int = 5,
     ) -> Dict[str, object]:
         """Initialise the propagation state and return the first snapshot."""
         self.reset()
@@ -350,44 +351,57 @@ class HoleAnalyzer:
         canny_low = max(0, int(canny_low))
         canny_high = max(canny_low + 1, int(canny_high))
 
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        x_inner_local = x_inner - x_outer
+        y_inner_local = y_inner - y_outer
+
+        crop = image[y_outer:bottom_outer, x_outer:right_outer].copy()
+        gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         if kernel > 1:
-            blurred_gray = cv2.GaussianBlur(gray, (kernel, kernel), 0)
-            blurred_color = cv2.GaussianBlur(image, (kernel, kernel), 0)
+            blurred_crop = cv2.GaussianBlur(crop, (kernel, kernel), 0)
+            blurred_gray = cv2.GaussianBlur(gray_crop, (kernel, kernel), 0)
         else:
-            blurred_gray = gray.copy()
-            blurred_color = image.copy()
+            blurred_crop = crop.copy()
+            blurred_gray = gray_crop.copy()
 
         edges = cv2.Canny(blurred_gray, canny_low, canny_high)
-        mask = np.zeros((h_img, w_img), dtype=np.uint8)
-        interior_mask = np.zeros((h_img, w_img), dtype=bool)
+        min_gap = max(1, int(min_gap))
+        if min_gap > 1:
+            if min_gap % 2 == 0:
+                min_gap += 1
+            kernel_gap = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (min_gap, min_gap))
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_gap)
+            edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_gap)
 
-        # Mark the inner ROI interior so we never expand inward.
+        mask = np.zeros((h_outer, w_outer), dtype=np.uint8)
+        interior_mask = np.zeros((h_outer, w_outer), dtype=bool)
+
         if w_inner > 2 and h_inner > 2:
             interior_mask[
-                y_inner + 1 : y_inner + h_inner - 1, x_inner + 1 : x_inner + w_inner - 1
+                y_inner_local + 1 : y_inner_local + h_inner - 1,
+                x_inner_local + 1 : x_inner_local + w_inner - 1,
             ] = True
-        edges[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner] = 0
+        edges[
+            y_inner_local : y_inner_local + h_inner,
+            x_inner_local : x_inner_local + w_inner,
+        ] = 0
 
         border_pixels = set()
-        # Horizontal borders
-        for xs in range(x_inner, x_inner + w_inner):
-            mask[y_inner, xs] = 1
-            border_pixels.add((y_inner, xs))
-            edges[y_inner, xs] = 0
+        for xs in range(x_inner_local, x_inner_local + w_inner):
+            mask[y_inner_local, xs] = 1
+            border_pixels.add((y_inner_local, xs))
+            edges[y_inner_local, xs] = 0
             if h_inner > 1:
-                y_bottom = y_inner + h_inner - 1
+                y_bottom = y_inner_local + h_inner - 1
                 mask[y_bottom, xs] = 1
                 border_pixels.add((y_bottom, xs))
                 edges[y_bottom, xs] = 0
 
-        # Vertical borders
-        for ys in range(y_inner, y_inner + h_inner):
-            mask[ys, x_inner] = 1
-            border_pixels.add((ys, x_inner))
-            edges[ys, x_inner] = 0
+        for ys in range(y_inner_local, y_inner_local + h_inner):
+            mask[ys, x_inner_local] = 1
+            border_pixels.add((ys, x_inner_local))
+            edges[ys, x_inner_local] = 0
             if w_inner > 1:
-                x_right = x_inner + w_inner - 1
+                x_right = x_inner_local + w_inner - 1
                 mask[ys, x_right] = 1
                 border_pixels.add((ys, x_right))
                 edges[ys, x_right] = 0
@@ -398,16 +412,28 @@ class HoleAnalyzer:
 
         mean_color = tuple(
             int(c)
-            for c in cv2.mean(image[y_inner : y_inner + h_inner, x_inner : x_inner + w_inner])[:3]
+            for c in cv2.mean(
+                crop[y_inner_local : y_inner_local + h_inner, x_inner_local : x_inner_local + w_inner]
+            )[:3]
         )
 
-        overlay = image.copy()
-        overlay[mask == 1] = ACTIVE_COLOR
+        overlay_full = image.copy()
+        overlay_local = overlay_full[y_outer:bottom_outer, x_outer:right_outer]
+        overlay_local[:] = crop
+        overlay_local[mask == 1] = ACTIVE_COLOR
+
+        edges_overlay_full = np.zeros_like(image)
+        edges_overlay_local = edges_overlay_full[y_outer:bottom_outer, x_outer:right_outer]
+        edges_overlay_local[edges > 0] = np.array([0, 255, 255], dtype=np.uint8)
+
+        blur_full = image.copy()
+        blur_full[y_outer:bottom_outer, x_outer:right_outer] = blurred_crop
 
         self.state = {
             "image": image,
-            "outer_bounds": (x_outer, y_outer, right_outer, bottom_outer),
-            "inner_roi": (x_inner, y_inner, w_inner, h_inner),
+            "origin": (x_outer, y_outer),
+            "width": w_outer,
+            "height": h_outer,
             "mask": mask,
             "interior_mask": interior_mask,
             "frontier": frontier,
@@ -420,11 +446,13 @@ class HoleAnalyzer:
             "frozen_count": 0,
             "blur_kernel": kernel,
             "edges": edges,
-            "blurred_color": blurred_color,
+            "edges_overlay_full": edges_overlay_full,
+            "blur_full": blur_full,
             "mean_color": mean_color,
             "canny_low": canny_low,
             "canny_high": canny_high,
-            "overlay_cache": overlay,
+            "overlay_full": overlay_full,
+            "overlay_local": overlay_local,
         }
 
         if logger.isEnabledFor(logging.DEBUG):
@@ -587,13 +615,14 @@ class HoleAnalyzer:
 
         mask = self.state["mask"]
         edges = self.state["edges"]
-        outer_bounds = self.state["outer_bounds"]
+        width = self.state["width"]
+        height = self.state["height"]
         interior = self.state["interior_mask"]
 
         self.state["active_count"] = max(0, self.state["active_count"] - 1)
 
         freeze_pixel = edges[y, x] > 0
-        neighbours = self._neighbours(y, x, outer_bounds)
+        neighbours = self._neighbours(y, x, width, height)
 
         for ny, nx in neighbours:
             if interior[ny, nx]:
@@ -618,20 +647,19 @@ class HoleAnalyzer:
                 self.state["next_frontier"].append((ny, nx))
                 self.state["active_count"] += 1
                 break
-        overlay = self.state["overlay_cache"]
+        overlay = self.state["overlay_local"]
         overlay[y, x] = FROZEN_COLOR
 
     @staticmethod
-    def _neighbours(y: int, x: int, bounds: Tuple[int, int, int, int]) -> List[Tuple[int, int]]:
-        x0, y0, x1, y1 = bounds
+    def _neighbours(y: int, x: int, width: int, height: int) -> List[Tuple[int, int]]:
         neighbours = []
-        if x > x0:
+        if x > 0:
             neighbours.append((y, x - 1))
-        if x + 1 < x1:
+        if x + 1 < width:
             neighbours.append((y, x + 1))
-        if y > y0:
+        if y > 0:
             neighbours.append((y - 1, x))
-        if y + 1 < y1:
+        if y + 1 < height:
             neighbours.append((y + 1, x))
         return neighbours
 
@@ -668,40 +696,53 @@ class HoleAnalyzer:
     def _ensure_overlay(self) -> np.ndarray:
         if not self.state:
             return np.zeros((1, 1, 3), dtype=np.uint8)
-        return self.state["overlay_cache"]
+        return self.state["overlay_full"]
 
     def _build_debug_layers(self, overlay: np.ndarray) -> Dict[str, np.ndarray]:
         if not self.debug_enabled or not self.state:
             return {}
 
         debug: Dict[str, np.ndarray] = {}
-        debug["Masque (overlay)"] = overlay
+        overlay_full = self.state.get("overlay_full")
+        if overlay_full is not None:
+            debug["Masque (overlay)"] = overlay_full
+            debug["Carte des états"] = overlay_full
 
-        state_map = self.state["image"].copy()
-        mask = self.state["mask"]
-        state_map[mask == 1] = (0, 0, 255)
-        state_map[mask == 2] = (212, 190, 6)
-        debug["Carte des états"] = state_map
+        edges_overlay = self.state.get("edges_overlay_full")
+        if edges_overlay is not None:
+            debug["Contours Canny (propagation)"] = edges_overlay
 
-        edges_vis = self.state["image"].copy()
-        edges_mask = self.state["edges"] > 0
-        edges_vis[edges_mask] = (0, 255, 255)
-        debug["Contours Canny (propagation)"] = edges_vis
-
-        blur_vis = self.state["blurred_color"].copy() if "blurred_color" in self.state else self.state["image"].copy()
-        x0, y0, x1, y1 = self.state["outer_bounds"]
-        base = self.state["image"]
-        if blur_vis.shape != base.shape:
-            blur_vis = base.copy()
-        else:
-            blur_vis = blur_vis.copy()
-        blur_vis[:y0, :] = base[:y0, :]
-        blur_vis[y1:, :] = base[y1:, :]
-        blur_vis[y0:y1, :x0] = base[y0:y1, :x0]
-        blur_vis[y0:y1, x1:] = base[y0:y1, x1:]
-        debug["Zone externe floutée"] = blur_vis
+        blur_full = self.state.get("blur_full")
+        if blur_full is not None:
+            debug["Zone externe floutée"] = blur_full
 
         return debug
+
+    def get_state_overlay(self) -> Optional[np.ndarray]:
+        if not self.state:
+            return None
+        return self.state.get("overlay_full")
+
+    def get_edges_image(self) -> Optional[np.ndarray]:
+        if not self.state:
+            return None
+        return self.state.get("edges_overlay_full")
+
+    def get_blur_image(self) -> Optional[np.ndarray]:
+        if not self.state:
+            return None
+        return self.state.get("blur_full")
+
+    def get_mask(self) -> Optional[np.ndarray]:
+        if not self.state:
+            return None
+        return self.state["mask"].copy()
+
+    def get_roi_geometry(self) -> Optional[Tuple[int, int, int, int]]:
+        if not self.state:
+            return None
+        origin_x, origin_y = self.state["origin"]
+        return origin_x, origin_y, self.state["width"], self.state["height"]
 
     @staticmethod
     def _empty_result(status: str) -> Dict[str, object]:
