@@ -375,6 +375,10 @@ class Step1Frame(tk.Frame):
         debug_frame = tk.Frame(header_frame, bg=PALETTE["background"])
         debug_frame.pack(side=tk.RIGHT)
         self.debug_enabled = tk.BooleanVar(value=True)
+        try:
+            self.app.hole_analyzer.set_debug(True)
+        except Exception:
+            propagation_logger.exception("Impossible d'activer le mode debug par défaut.")
         self.debug_toggle = ttk.Checkbutton(
             debug_frame,
             text="Mode debug",
@@ -677,6 +681,26 @@ class Step1Frame(tk.Frame):
         propagation_frame = tk.Frame(controls, bg=PALETTE["panel"])
         propagation_frame.pack(fill=tk.X, padx=20, pady=(6, 8))
 
+        self.propagation_status_var = tk.StringVar(value="Propagation : en attente")
+        self.propagation_status_label = tk.Label(
+            propagation_frame,
+            textvariable=self.propagation_status_var,
+            bg=PALETTE["panel"],
+            fg=PALETTE["accent"],
+            font=("Segoe UI Semibold", 11),
+            anchor="w",
+        )
+        self.propagation_status_label.pack(fill=tk.X, pady=(0, 6))
+
+        self.btn_start_propagation = self.app.make_button(
+            propagation_frame,
+            "▶ Lancer la propagation",
+            self.on_start_propagation_clicked,
+            variant="accent",
+        )
+        self.btn_start_propagation.pack(fill=tk.X, pady=(0, 6))
+        self.btn_start_propagation.state(["disabled"])
+
         self.step_mode_var = tk.BooleanVar(value=False)
         self.step_mode_toggle = ttk.Checkbutton(
             propagation_frame,
@@ -776,11 +800,18 @@ class Step1Frame(tk.Frame):
         self.canvas.on_outer_selected = self.on_outer_selected
         self.canvas.on_inner_selected = self.on_inner_selected
 
+        self.propagation_state = "idle"
+        self.propagation_needs_restart = False
+        self.last_propagation_stats: Optional[Dict[str, int]] = None
+
         self.auto_running = False
         self.worker_thread = None
         self.worker_queue = None
         self.worker_stop_event = None
         self.worker_poll_after = None
+
+        self.update_debug_controls()
+        self.update_propagation_controls()
 
     def _on_controls_mousewheel(self, event):
         if event.delta:
@@ -878,11 +909,18 @@ class Step1Frame(tk.Frame):
         self.detected_pieces = None
         self.analysis = {}
         self.analysis_display = None
-        self.debug_enabled.set(False)
+        self.debug_enabled.set(True)
+        try:
+            self.app.hole_analyzer.set_debug(True)
+        except Exception:
+            propagation_logger.exception("Impossible de réactiver le mode debug après chargement.")
         self.app.hole_analyzer.reset()
         self.update_debug_controls()
         self.update_step_controls()
         self.last_frame_time = None
+        self.propagation_needs_restart = False
+        self.last_propagation_stats = None
+        self.update_propagation_controls()
 
         self.btn_select_outer.state(["!disabled"])
         self.btn_select_inner.state(["disabled"])
@@ -1178,16 +1216,12 @@ class Step1Frame(tk.Frame):
         if self.step_mode_var.get():
             self.stop_auto_propagation()
             self.update_step_controls()
+            self.update_propagation_controls()
             return
 
-        # Auto mode
-        if (
-            self.analysis
-            and self.analysis.get("status") == "ok"
-            and not self.analysis.get("complete", False)
-        ):
-            self.start_auto_propagation()
+        # Back to auto mode → just refresh control states.
         self.update_step_controls()
+        self.update_propagation_controls()
 
     def update_step_controls(self):
         """Enable or disable stepping buttons."""
@@ -1202,6 +1236,88 @@ class Step1Frame(tk.Frame):
         else:
             self.btn_step_pixel.state(["disabled"])
             self.btn_step_loop.state(["disabled"])
+
+    def on_start_propagation_clicked(self):
+        """Start propagation when the user requests it explicitly."""
+        if self.auto_running:
+            return
+        if not self.analysis or self.analysis.get("status") != "ok":
+            return
+        if self.analysis.get("complete", False):
+            return
+
+        self.propagation_needs_restart = False
+        self.start_auto_propagation()
+
+    def _capture_last_propagation_stats(self):
+        """Snapshot key metrics from the current analysis before it becomes stale."""
+        current = self.analysis or {}
+        if current.get("status") != "ok":
+            return
+
+        processed = int(current.get("processed_pixels", 0) or 0)
+        complete = bool(current.get("complete", False))
+        if processed <= 0 and not complete:
+            return
+
+        self.last_propagation_stats = {
+            "loops": int(current.get("loops_completed", 0) or 0),
+            "processed": processed,
+            "frozen": int(current.get("frozen_count", 0) or 0),
+            "active": int(current.get("active_count", 0) or 0),
+            "frontier": int(current.get("frontier_count", 0) or 0),
+        }
+
+    def update_propagation_controls(self):
+        """Refresh status indicators and start button availability."""
+        state = "idle"
+        analysis_data = self.analysis if isinstance(self.analysis, dict) else {}
+        analysis_ready = analysis_data.get("status") == "ok"
+        analysis_complete = bool(analysis_data.get("complete", False)) if analysis_ready else False
+
+        if self.auto_running:
+            state = "running"
+        elif not analysis_ready:
+            state = "idle"
+        elif analysis_complete:
+            state = "complete"
+        elif self.propagation_needs_restart:
+            state = "stale"
+        else:
+            state = "ready"
+
+        self.propagation_state = state
+
+        stats_text = ""
+        stats = self.last_propagation_stats or {}
+        if state == "stale" and stats:
+            stats_text = (
+                f"\nDernier run · boucles : {stats.get('loops', 0)} · "
+                f"figés : {stats.get('frozen', 0)} · pixels : {stats.get('processed', 0)}"
+            )
+
+        status_messages = {
+            "idle": "Propagation : en attente",
+            "ready": "Propagation : prête à démarrer",
+            "stale": "Propagation : périmée (réglages modifiés)",
+            "running": "Propagation : en cours",
+            "complete": "Propagation : terminée",
+        }
+        self.propagation_status_var.set(status_messages.get(state, "Propagation : en attente") + stats_text)
+
+        # Update start button
+        if self.auto_running or not analysis_ready or analysis_complete or self.step_mode_var.get():
+            self.btn_start_propagation.state(["disabled"])
+        else:
+            self.btn_start_propagation.state(["!disabled"])
+
+        if self.auto_running:
+            self.btn_start_propagation.config(text="Propagation en cours…")
+        else:
+            if self.propagation_needs_restart and analysis_ready and not analysis_complete:
+                self.btn_start_propagation.config(text="▶ Relancer la propagation")
+            else:
+                self.btn_start_propagation.config(text="▶ Lancer la propagation")
 
     def start_auto_propagation(self):
         """Launch propagation in a background worker and poll results."""
@@ -1225,6 +1341,7 @@ class Step1Frame(tk.Frame):
             self.auto_pixels_budget,
             self.auto_chunk_size,
         )
+        self.propagation_needs_restart = False
         self.auto_running = True
         self.force_render = True
         self.worker_queue = queue.Queue(maxsize=2)
@@ -1232,6 +1349,7 @@ class Step1Frame(tk.Frame):
         self.worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         self.worker_thread.start()
         self._schedule_worker_poll()
+        self.update_propagation_controls()
 
     def _schedule_worker_poll(self):
         if self.worker_poll_after is not None:
@@ -1328,6 +1446,7 @@ class Step1Frame(tk.Frame):
             propagation_logger.debug("Auto-propagation interrompue.")
         self.auto_running = False
         self.force_render = True
+        self.update_propagation_controls()
 
     def apply_analysis_result(self, analysis: Optional[Dict[str, object]]):
         """Store and display the latest analysis snapshot."""
@@ -1335,6 +1454,8 @@ class Step1Frame(tk.Frame):
             analysis = {}
 
         self.analysis = analysis
+        if analysis.get("processed_pixels", 0) or analysis.get("complete", False):
+            self.propagation_needs_restart = False
 
         now = time.perf_counter()
         frame_dt = None
@@ -1390,6 +1511,7 @@ class Step1Frame(tk.Frame):
                 analysis.get("loops_completed", 0),
                 f"{fps_value:.1f}" if fps_value is not None else "idle",
             )
+        self.update_propagation_controls()
 
     def update_summary_from_analysis(self):
         """Refresh UI labels based on the current analysis state."""
@@ -1417,16 +1539,34 @@ class Step1Frame(tk.Frame):
         frontier = analysis.get("frontier_count", 0)
         pending = analysis.get("pending_count", 0)
 
-        if complete:
+        if self.auto_running:
+            self.summary_label.config(
+                text=f"Propagation en cours · boucle #{loops + 1}. Pixels actifs : {active}."
+            )
+            self.btn_next.state(["disabled"])
+        elif complete:
             loop_text = "1 boucle" if loops == 1 else f"{loops} boucles"
             self.summary_label.config(
                 text=f"Propagation terminée ({loop_text}). Pixels figés : {frozen}."
             )
             self.stop_auto_propagation()
             self.btn_next.state(["!disabled"])
+        elif self.propagation_needs_restart:
+            last_stats = self.last_propagation_stats or {}
+            extra = ""
+            if last_stats:
+                extra = (
+                    f"\nDernier run : {last_stats.get('loops', 0)} boucles, "
+                    f"{last_stats.get('frozen', 0)} pixels figés."
+                )
+            self.summary_label.config(
+                text="Propagation périmée (réglages modifiés). Relancez-la pour appliquer les changements."
+                + extra
+            )
+            self.btn_next.state(["disabled"])
         else:
             self.summary_label.config(
-                text=f"Propagation en cours · boucle #{loops + 1}. Pixels actifs : {active}."
+                text="Propagation prête. Cliquez sur « ▶ Lancer la propagation » pour continuer."
             )
             self.btn_next.state(["disabled"])
 
@@ -1483,6 +1623,7 @@ class Step1Frame(tk.Frame):
             self.param_update_after = None
         self.force_render = True
         self.last_render_time = 0.0
+        self._capture_last_propagation_stats()
 
         outer = self.app.puzzle_calibration.outer_roi
         inner = self.app.puzzle_calibration.inner_roi
@@ -1524,9 +1665,11 @@ class Step1Frame(tk.Frame):
         )
         if analysis.get("status") != "ok":
             propagation_logger.warning("Analyse échouée (statut=%s).", analysis.get("status"))
+            self.propagation_needs_restart = False
             self.apply_analysis_result(analysis)
             return
 
+        self.propagation_needs_restart = self.last_propagation_stats is not None
         self.apply_analysis_result(analysis)
 
         if self.detected_pieces is not None:
@@ -1535,8 +1678,7 @@ class Step1Frame(tk.Frame):
                 fg=PALETTE["accent"] if self.detected_pieces else PALETTE["muted"],
             )
 
-        if not self.step_mode_var.get():
-            self.start_auto_propagation()
+        self.update_propagation_controls()
 
     def render_display(self):
         if self.base_image is None:
