@@ -723,6 +723,70 @@ class CalibrationCanvas(ZoomableImageCanvas):
         img_with_overlay = draw_roi_overlay(self.base_image, self.roi or self.outer_roi, self.inner_roi)
         self.set_display_image(img_with_overlay)
 
+    def focus_on_roi(self, roi: Optional[Tuple[int, int, int, int]], margin_ratio: float = 0.1):
+        """Zoom and center the view on the given ROI with an additional margin."""
+        if self.base_image is None or not roi:
+            return
+
+        try:
+            margin_ratio = float(margin_ratio)
+        except (TypeError, ValueError):
+            margin_ratio = 0.1
+        margin_ratio = max(0.0, margin_ratio)
+
+        canvas_w = max(1, self.winfo_width())
+        canvas_h = max(1, self.winfo_height())
+        if canvas_w <= 1 or canvas_h <= 1:
+            self.after(40, lambda: self.focus_on_roi(roi, margin_ratio))
+            return
+
+        x, y, w, h = roi
+        if w <= 0 or h <= 0:
+            return
+
+        margin_x = max(10.0, w * margin_ratio)
+        margin_y = max(10.0, h * margin_ratio)
+
+        left = x - margin_x
+        top = y - margin_y
+        right = x + w + margin_x
+        bottom = y + h + margin_y
+
+        if left < 0:
+            right = min(right - left, float(self.base_width))
+            left = 0.0
+        if right > self.base_width:
+            left = max(0.0, left - (right - self.base_width))
+            right = float(self.base_width)
+        if top < 0:
+            bottom = min(bottom - top, float(self.base_height))
+            top = 0.0
+        if bottom > self.base_height:
+            top = max(0.0, top - (bottom - self.base_height))
+            bottom = float(self.base_height)
+
+        region_w = max(1.0, right - left)
+        region_h = max(1.0, bottom - top)
+
+        zoom_x = canvas_w / region_w
+        zoom_y = canvas_h / region_h
+        target_zoom = min(zoom_x, zoom_y)
+
+        if self.max_zoom is not None:
+            target_zoom = min(target_zoom, self.max_zoom)
+        target_zoom = max(self.min_zoom, target_zoom)
+        if target_zoom <= 0:
+            target_zoom = self.min_zoom if self.min_zoom > 0 else 1.0
+
+        self.zoom = target_zoom
+        self.user_zoomed = True
+
+        center_x = (left + right) / 2.0
+        center_y = (top + bottom) / 2.0
+
+        self._update_offset_after_zoom(center_x, center_y, canvas_w / 2.0, canvas_h / 2.0)
+        self._render_image()
+
     def clear(self):
         """Clear canvas."""
         super().clear_image()
@@ -835,6 +899,7 @@ class CalibrationCanvas(ZoomableImageCanvas):
         elif self.mode == "outer":
             self.outer_roi = (x, y, w, h)
             self.draw_roi_overlay()
+            self.focus_on_roi(self.outer_roi)
             if self.on_outer_selected:
                 self.on_outer_selected(self.outer_roi)
 

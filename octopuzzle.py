@@ -1070,6 +1070,7 @@ class Step1Frame(tk.Frame):
         self.btn_select_inner.state(["!disabled"])
         self.btn_refresh.state(["!disabled"])
         self.canvas.set_mode("none")
+        self.canvas.focus_on_roi(roi, margin_ratio=0.1)
         self.force_render = True
         propagation_logger.info("ROI externe définie : %s", roi)
         self.run_analysis()
@@ -1711,7 +1712,16 @@ class Step1Frame(tk.Frame):
     def _compose_debug_image(self) -> Optional[np.ndarray]:
         if self.base_image is None:
             return None
-        composite = self.base_image.copy()
+        base = self.base_image
+
+        # Start from ROI overlay if available so that the outer area stays highlighted.
+        primary_roi = self.canvas.outer_roi or self.canvas.inner_roi
+        secondary_roi = None
+        if self.canvas.outer_roi and self.canvas.inner_roi:
+            secondary_roi = self.canvas.inner_roi
+        composite = (
+            draw_roi_overlay(base, primary_roi, secondary_roi) if primary_roi else base.copy()
+        )
         analyzer = self.app.hole_analyzer
         if not analyzer:
             return composite
