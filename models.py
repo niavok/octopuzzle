@@ -318,7 +318,11 @@ class HoleAnalyzer:
         blur_kernel: int = 5,
         canny_low: int = 45,
         canny_high: int = 110,
-        min_gap: int = 5,
+        closing_radius: int = 5,
+        opening_radius: int = 0,
+        closing_enabled: bool = True,
+        opening_enabled: bool = False,
+        edge_min_area: int = 0,
     ) -> Dict[str, object]:
         """Initialise the propagation state and return the first snapshot."""
         self.reset()
@@ -364,13 +368,34 @@ class HoleAnalyzer:
             blurred_gray = gray_crop.copy()
 
         edges = cv2.Canny(blurred_gray, canny_low, canny_high)
-        min_gap = max(1, int(min_gap))
-        if min_gap > 1:
-            if min_gap % 2 == 0:
-                min_gap += 1
-            kernel_gap = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (min_gap, min_gap))
-            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_gap)
-            edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_gap)
+        closing_radius = max(1, int(closing_radius))
+        opening_radius = max(1, int(opening_radius))
+        if closing_radius % 2 == 0:
+            closing_radius += 1
+        if opening_radius % 2 == 0:
+            opening_radius += 1
+
+        if closing_enabled and closing_radius > 1:
+            kernel_close = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (closing_radius, closing_radius)
+            )
+            edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel_close)
+
+        if opening_enabled and opening_radius > 1:
+            kernel_open = cv2.getStructuringElement(
+                cv2.MORPH_ELLIPSE, (opening_radius, opening_radius)
+            )
+            edges = cv2.morphologyEx(edges, cv2.MORPH_OPEN, kernel_open)
+
+        edge_min_area = max(0, int(edge_min_area))
+        if edge_min_area > 0:
+            binary = (edges > 0).astype(np.uint8)
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+            filtered = np.zeros_like(edges)
+            for label_idx in range(1, num_labels):
+                if stats[label_idx, cv2.CC_STAT_AREA] >= edge_min_area:
+                    filtered[labels == label_idx] = 255
+            edges = filtered
 
         mask = np.zeros((h_outer, w_outer), dtype=np.uint8)
         interior_mask = np.zeros((h_outer, w_outer), dtype=bool)
@@ -451,17 +476,30 @@ class HoleAnalyzer:
             "mean_color": mean_color,
             "canny_low": canny_low,
             "canny_high": canny_high,
+            "closing_enabled": bool(closing_enabled),
+            "closing_radius": closing_radius,
+            "opening_enabled": bool(opening_enabled),
+            "opening_radius": opening_radius,
+            "edge_min_area": edge_min_area,
             "overlay_full": overlay_full,
             "overlay_local": overlay_local,
         }
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "Propagation initialisée (inner=%s outer=%s frontier=%d mean_color=%s)",
+                (
+                    "Propagation initialisée (inner=%s outer=%s frontier=%d mean_color=%s "
+                    "closing=%s/%d opening=%s/%d edge_min=%d)"
+                ),
                 (x_inner, y_inner, w_inner, h_inner),
                 outer_roi,
                 len(frontier),
                 mean_color,
+                closing_enabled,
+                closing_radius,
+                opening_enabled,
+                opening_radius,
+                edge_min_area,
             )
 
         return self._build_result(status="ok")
@@ -691,6 +729,11 @@ class HoleAnalyzer:
             "mean_color": self.state["mean_color"],
             "canny_low": self.state["canny_low"],
             "canny_high": self.state["canny_high"],
+            "closing_enabled": self.state.get("closing_enabled", True),
+            "closing_radius": self.state.get("closing_radius", 5),
+            "opening_enabled": self.state.get("opening_enabled", False),
+            "opening_radius": self.state.get("opening_radius", 0),
+            "edge_min_area": self.state.get("edge_min_area", 0),
         }
 
     def _ensure_overlay(self) -> np.ndarray:

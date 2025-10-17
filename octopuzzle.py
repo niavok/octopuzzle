@@ -561,6 +561,7 @@ class Step1Frame(tk.Frame):
             width=8,
         )
         self.blur_kernel_input.pack(anchor=tk.W)
+        self._bind_spinbox_mousewheel(self.blur_kernel_input)
 
         edges_frame = tk.Frame(controls, bg=PALETTE["panel"])
         edges_frame.pack(fill=tk.X, padx=20, pady=(0, 12))
@@ -592,6 +593,7 @@ class Step1Frame(tk.Frame):
             width=6,
         )
         low_spin.pack(side=tk.LEFT, padx=(8, 16))
+        self._bind_spinbox_mousewheel(low_spin)
 
         tk.Label(
             thresholds_row,
@@ -610,70 +612,88 @@ class Step1Frame(tk.Frame):
             width=6,
         )
         high_spin.pack(side=tk.LEFT, padx=(8, 0))
+        self._bind_spinbox_mousewheel(high_spin)
         self.blur_kernel_var.trace_add("write", self.on_parameter_changed)
         self.canny_low_var.trace_add("write", self.on_parameter_changed)
         self.canny_high_var.trace_add("write", self.on_parameter_changed)
 
-        gap_frame = tk.Frame(controls, bg=PALETTE["panel"])
-        gap_frame.pack(fill=tk.X, padx=20, pady=(0, 12))
+        cleanup = tk.Frame(controls, bg=PALETTE["panel"])
+        cleanup.pack(fill=tk.X, padx=20, pady=(0, 12))
         tk.Label(
-            gap_frame,
-            text="Passage minimal (px)",
+            cleanup,
+            text="Nettoyage des contours",
             font=("Segoe UI Semibold", 11),
             bg=PALETTE["panel"],
             fg=PALETTE["text"],
         ).pack(anchor=tk.W, pady=(0, 4))
-        self.min_gap_var = tk.IntVar(value=5)
-        self.min_gap_input = ttk.Spinbox(
-            gap_frame,
-            from_=1,
-            to=50,
-            increment=1,
-            textvariable=self.min_gap_var,
-            width=6,
+
+        closing_row = tk.Frame(cleanup, bg=PALETTE["panel"])
+        closing_row.pack(fill=tk.X, pady=2)
+        self.closing_enabled_var = tk.BooleanVar(value=True)
+        self.closing_radius_var = tk.IntVar(value=5)
+        self.closing_check = ttk.Checkbutton(
+            closing_row,
+            text="Fermeture (anti-fuites)",
+            variable=self.closing_enabled_var,
+            command=self.on_closing_toggle,
+            style=CHECKBUTTON_STYLE,
         )
-        self.min_gap_input.pack(anchor=tk.W)
-        self.min_gap_var.trace_add("write", self.on_parameter_changed)
+        self.closing_check.pack(side=tk.LEFT)
+        self.closing_radius_input = ttk.Spinbox(
+            closing_row,
+            from_=1,
+            to=99,
+            increment=1,
+            textvariable=self.closing_radius_var,
+            width=5,
+        )
+        self.closing_radius_input.pack(side=tk.RIGHT)
+        self._bind_spinbox_mousewheel(self.closing_radius_input)
+        self.closing_radius_var.trace_add("write", self.on_parameter_changed)
+
+        opening_row = tk.Frame(cleanup, bg=PALETTE["panel"])
+        opening_row.pack(fill=tk.X, pady=2)
+        self.opening_enabled_var = tk.BooleanVar(value=False)
+        self.opening_radius_var = tk.IntVar(value=3)
+        self.opening_check = ttk.Checkbutton(
+            opening_row,
+            text="Ouverture (débouchage)",
+            variable=self.opening_enabled_var,
+            command=self.on_opening_toggle,
+            style=CHECKBUTTON_STYLE,
+        )
+        self.opening_check.pack(side=tk.LEFT)
+        self.opening_radius_input = ttk.Spinbox(
+            opening_row,
+            from_=1,
+            to=99,
+            increment=1,
+            textvariable=self.opening_radius_var,
+            width=5,
+        )
+        self.opening_radius_input.pack(side=tk.RIGHT)
+        self._bind_spinbox_mousewheel(self.opening_radius_input)
+        self.opening_radius_var.trace_add("write", self.on_parameter_changed)
 
         tk.Label(
-            controls,
-            text="Filtre de surface (px²)",
-            font=("Segoe UI Semibold", 11),
+            cleanup,
+            text="Surface min. contour conservé (px²)",
             bg=PALETTE["panel"],
-            fg=PALETTE["text"],
-        ).pack(anchor=tk.W, padx=20, pady=(4, 2))
-
-        area_frame = tk.Frame(controls, bg=PALETTE["panel"])
-        area_frame.pack(fill=tk.X, padx=20)
-        area_frame.columnconfigure(1, weight=1)
-
-        tk.Label(area_frame, text="Min", bg=PALETTE["panel"], fg=PALETTE["muted"]).grid(
-            row=0, column=0, sticky="w", pady=2
-        )
-        self.min_area_var = tk.IntVar(value=500)
-        self.min_area_input = ttk.Spinbox(
-            area_frame,
-            from_=10,
-            to=200000,
-            increment=50,
-            textvariable=self.min_area_var,
-            width=10,
-        )
-        self.min_area_input.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=2)
-
-        tk.Label(area_frame, text="Max", bg=PALETTE["panel"], fg=PALETTE["muted"]).grid(
-            row=1, column=0, sticky="w", pady=2
-        )
-        self.max_area_var = tk.IntVar(value=50000)
-        self.max_area_input = ttk.Spinbox(
-            area_frame,
-            from_=100,
+            fg=PALETTE["muted"],
+        ).pack(anchor=tk.W, pady=(6, 2))
+        self.edge_min_area_var = tk.IntVar(value=0)
+        self.edge_min_area_input = ttk.Spinbox(
+            cleanup,
+            from_=0,
             to=500000,
             increment=100,
-            textvariable=self.max_area_var,
+            textvariable=self.edge_min_area_var,
             width=10,
         )
-        self.max_area_input.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(2, 8))
+        self.edge_min_area_input.pack(anchor=tk.W)
+        self._bind_spinbox_mousewheel(self.edge_min_area_input)
+        self.edge_min_area_var.trace_add("write", self.on_parameter_changed)
+        self.update_edge_controls()
 
         self.status_display = CalibrationStatusDisplay(controls)
         self.status_display.pack(fill=tk.X, padx=18, pady=(12, 8))
@@ -823,6 +843,16 @@ class Step1Frame(tk.Frame):
             self.controls_canvas.yview_scroll(3, "units")
         return "break"
 
+    def _bind_spinbox_mousewheel(self, widget: tk.Widget) -> None:
+        """Prevent spinbox wheel from changing value; forward to the scroll area instead."""
+
+        def _forward(event):
+            self._on_controls_mousewheel(event)
+            return "break"
+
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, _forward, add="+")
+
     def _enable_controls_scroll(self, _event):
         self.controls_canvas.bind_all("<MouseWheel>", self._on_controls_mousewheel)
         self.controls_canvas.bind_all("<Button-4>", self._on_controls_mousewheel)
@@ -915,7 +945,13 @@ class Step1Frame(tk.Frame):
         except Exception:
             propagation_logger.exception("Impossible de réactiver le mode debug après chargement.")
         self.app.hole_analyzer.reset()
+        self._set_var_safely(self.closing_enabled_var, True)
+        self._set_var_safely(self.closing_radius_var, 5)
+        self._set_var_safely(self.opening_enabled_var, False)
+        self._set_var_safely(self.opening_radius_var, 3)
+        self._set_var_safely(self.edge_min_area_var, 0)
         self.update_debug_controls()
+        self.update_edge_controls()
         self.update_step_controls()
         self.last_frame_time = None
         self.propagation_needs_restart = False
@@ -971,9 +1007,11 @@ class Step1Frame(tk.Frame):
             "blur_kernel": int(self.blur_kernel_var.get()),
             "canny_low": int(self.canny_low_var.get()),
             "canny_high": int(self.canny_high_var.get()),
-            "min_area": int(self.min_area_var.get()),
-            "max_area": int(self.max_area_var.get()),
-            "min_gap": int(self.min_gap_var.get()),
+            "closing_enabled": bool(self.closing_enabled_var.get()),
+            "closing_radius": int(self.closing_radius_var.get()),
+            "opening_enabled": bool(self.opening_enabled_var.get()),
+            "opening_radius": int(self.opening_radius_var.get()),
+            "edge_min_area": int(self.edge_min_area_var.get()),
         }
 
     def apply_state(self, state: Optional[Dict[str, Any]]) -> None:
@@ -992,12 +1030,25 @@ class Step1Frame(tk.Frame):
             self._set_var_safely(self.canny_low_var, int(state["canny_low"]))
         if "canny_high" in state:
             self._set_var_safely(self.canny_high_var, int(state["canny_high"]))
-        if "min_area" in state:
-            self._set_var_safely(self.min_area_var, int(state["min_area"]))
-        if "max_area" in state:
-            self._set_var_safely(self.max_area_var, int(state["max_area"]))
-        if "min_gap" in state:
-            self._set_var_safely(self.min_gap_var, int(state["min_gap"]))
+        if "closing_enabled" in state:
+            self._set_var_safely(
+                self.closing_enabled_var, self._coerce_bool(state["closing_enabled"], True)
+            )
+        if "closing_radius" in state:
+            self._set_var_safely(self.closing_radius_var, int(state["closing_radius"]))
+        if "opening_enabled" in state:
+            self._set_var_safely(
+                self.opening_enabled_var, self._coerce_bool(state["opening_enabled"], False)
+            )
+        if "opening_radius" in state:
+            self._set_var_safely(self.opening_radius_var, int(state["opening_radius"]))
+        if "edge_min_area" in state:
+            self._set_var_safely(self.edge_min_area_var, int(state["edge_min_area"]))
+
+        # Legacy compatibility for older sessions.
+        if "min_gap" in state and "closing_radius" not in state:
+            self._set_var_safely(self.closing_radius_var, int(state["min_gap"]))
+            self._set_var_safely(self.closing_enabled_var, True)
 
         if self.base_image is None:
             # Without image there is nothing else to restore.
@@ -1013,6 +1064,8 @@ class Step1Frame(tk.Frame):
         if inner_roi:
             self.canvas.inner_roi = inner_roi
             self.on_inner_selected(inner_roi)
+
+        self.update_edge_controls()
 
     def apply_cli_overrides(self, args: argparse.Namespace) -> None:
         """Apply command-line overrides when launching the app."""
@@ -1037,12 +1090,25 @@ class Step1Frame(tk.Frame):
             self._set_var_safely(self.canny_low_var, int(args.canny_low))
         if getattr(args, "canny_high", None) is not None:
             self._set_var_safely(self.canny_high_var, int(args.canny_high))
-        if getattr(args, "min_area", None) is not None:
-            self._set_var_safely(self.min_area_var, int(args.min_area))
-        if getattr(args, "max_area", None) is not None:
-            self._set_var_safely(self.max_area_var, int(args.max_area))
-        if getattr(args, "min_gap", None) is not None:
-            self._set_var_safely(self.min_gap_var, int(args.min_gap))
+        if getattr(args, "closing_radius", None) is not None:
+            self._set_var_safely(self.closing_radius_var, int(args.closing_radius))
+            self._set_var_safely(self.closing_enabled_var, True)
+        elif getattr(args, "min_gap", None) is not None:
+            # Legacy alias
+            self._set_var_safely(self.closing_radius_var, int(args.min_gap))
+            self._set_var_safely(self.closing_enabled_var, True)
+        if getattr(args, "disable_closing", False):
+            self._set_var_safely(self.closing_enabled_var, False)
+        if getattr(args, "opening_radius", None) is not None:
+            self._set_var_safely(self.opening_radius_var, int(args.opening_radius))
+        if getattr(args, "enable_opening", False):
+            self._set_var_safely(self.opening_enabled_var, True)
+        if getattr(args, "disable_opening", False):
+            self._set_var_safely(self.opening_enabled_var, False)
+        if getattr(args, "edge_min_area", None) is not None:
+            self._set_var_safely(self.edge_min_area_var, int(args.edge_min_area))
+
+        self.update_edge_controls()
 
         if self.base_image is None:
             outer_roi = getattr(args, "outer_roi", None)
@@ -1176,16 +1242,53 @@ class Step1Frame(tk.Frame):
         self._set_var_safely(self.canny_high_var, high)
         return low, high
 
-    def get_min_gap(self) -> int:
-        """Return the minimum passage width (pixels)."""
+    def get_closing_radius(self) -> int:
+        """Return a valid radius for the closing kernel."""
         try:
-            gap = int(self.min_gap_var.get())
+            value = int(self.closing_radius_var.get())
         except Exception:
-            gap = 5
-            self._set_var_safely(self.min_gap_var, gap)
-        gap = max(1, gap)
-        self._set_var_safely(self.min_gap_var, gap)
-        return gap
+            value = 5
+            self._set_var_safely(self.closing_radius_var, value)
+        value = max(1, value)
+        # Enforce odd size for better symmetry.
+        if value % 2 == 0:
+            value += 1
+            self._set_var_safely(self.closing_radius_var, value)
+        return value
+
+    def get_opening_radius(self) -> int:
+        """Return a valid radius for the opening kernel."""
+        try:
+            value = int(self.opening_radius_var.get())
+        except Exception:
+            value = 3
+            self._set_var_safely(self.opening_radius_var, value)
+        value = max(1, value)
+        if value % 2 == 0:
+            value += 1
+            self._set_var_safely(self.opening_radius_var, value)
+        return value
+
+    def get_edge_min_area(self) -> int:
+        """Return the minimum area (px²) to keep an edge component."""
+        try:
+            value = int(self.edge_min_area_var.get())
+        except Exception:
+            value = 0
+            self._set_var_safely(self.edge_min_area_var, value)
+        value = max(0, value)
+        self._set_var_safely(self.edge_min_area_var, value)
+        return value
+
+    @staticmethod
+    def _coerce_bool(value: object, default: bool = False) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return default
 
     def on_parameter_changed(self, *_args):
         """Debounced hook to recompute the propagation when parameters change."""
@@ -1211,6 +1314,28 @@ class Step1Frame(tk.Frame):
     def _apply_parameter_update(self):
         self.param_update_after = None
         self.run_analysis()
+
+    def on_closing_toggle(self):
+        """Toggle the closing operation."""
+        self.update_edge_controls()
+        self.on_parameter_changed()
+
+    def on_opening_toggle(self):
+        """Toggle the opening operation."""
+        self.update_edge_controls()
+        self.on_parameter_changed()
+
+    def update_edge_controls(self):
+        """Enable/disable spinboxes based on toggle states."""
+        if self.closing_enabled_var.get():
+            self.closing_radius_input.state(["!disabled"])
+        else:
+            self.closing_radius_input.state(["disabled"])
+
+        if self.opening_enabled_var.get():
+            self.opening_radius_input.state(["!disabled"])
+        else:
+            self.opening_radius_input.state(["disabled"])
 
     def on_step_mode_toggle(self):
         """Handle toggling of the step-by-step mode."""
@@ -1648,21 +1773,42 @@ class Step1Frame(tk.Frame):
 
         blur_kernel = self.get_blur_kernel()
         canny_low, canny_high = self.get_canny_thresholds()
-        min_gap = self.get_min_gap()
+        closing_enabled = bool(self.closing_enabled_var.get())
+        closing_radius = self.get_closing_radius()
+        opening_enabled = bool(self.opening_enabled_var.get())
+        opening_radius = self.get_opening_radius()
+        edge_min_area = self.get_edge_min_area()
         self.auto_pixels_budget = float(self.AUTO_PIXELS_PER_FRAME)
         self.auto_chunk_size = float(self.AUTO_CHUNK_SIZE)
         propagation_logger.info(
-            "Analyse lancée (blur=%d, canny=(%d,%d), gap=%d, outer=%s, inner=%s).",
+            (
+                "Analyse lancée (blur=%d, canny=(%d,%d), closing=%s/%d, opening=%s/%d, "
+                "edge_min=%d, outer=%s, inner=%s)."
+            ),
             blur_kernel,
             canny_low,
             canny_high,
-            min_gap,
+            closing_enabled,
+            closing_radius,
+            opening_enabled,
+            opening_radius,
+            edge_min_area,
             outer,
             inner,
         )
 
         analysis = self.app.hole_analyzer.prepare(
-            self.base_image, outer, inner, blur_kernel, canny_low, canny_high, min_gap
+            self.base_image,
+            outer,
+            inner,
+            blur_kernel,
+            canny_low,
+            canny_high,
+            closing_radius=closing_radius,
+            opening_radius=opening_radius,
+            closing_enabled=closing_enabled,
+            opening_enabled=opening_enabled,
+            edge_min_area=edge_min_area,
         )
         if analysis.get("status") != "ok":
             propagation_logger.warning("Analyse échouée (statut=%s).", analysis.get("status"))
@@ -1912,6 +2058,7 @@ class Step2Frame(tk.Frame):
             width=10,
         )
         self.min_area_input.grid(row=0, column=1, sticky="ew", padx=(10, 0), pady=2)
+        self._bind_spinbox_mousewheel(self.min_area_input)
 
         tk.Label(area_frame, text="Max", bg=PALETTE["panel"], fg=PALETTE["muted"]).grid(
             row=1, column=0, sticky="w", pady=2
@@ -1926,6 +2073,7 @@ class Step2Frame(tk.Frame):
             width=10,
         )
         self.max_area_input.grid(row=1, column=1, sticky="ew", padx=(10, 0), pady=(2, 8))
+        self._bind_spinbox_mousewheel(self.max_area_input)
 
         self.status_display = CalibrationStatusDisplay(controls)
         self.status_display.pack(fill=tk.X, padx=18, pady=(12, 8))
@@ -1962,6 +2110,15 @@ class Step2Frame(tk.Frame):
         )
         self.btn_next.pack(side=tk.RIGHT)
         self.btn_next.state(["disabled"])
+
+    def _bind_spinbox_mousewheel(self, widget: tk.Widget) -> None:
+        """Prevent mouse wheel from changing spinbox values."""
+
+        def _ignore(_event):
+            return "break"
+
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            widget.bind(sequence, _ignore, add="+")
 
     def load_images(self):
         """Load multiple available pieces images."""
@@ -2163,8 +2320,15 @@ class Step2Frame(tk.Frame):
             self.on_background_selected(bg)
 
     def apply_cli_overrides(self, args: argparse.Namespace) -> None:
-        """Currently unused placeholder for CLI overrides on step 2."""
-        _ = args  # Placeholder to avoid unused warnings.
+        """Apply CLI overrides relevant to the pieces calibration."""
+        if getattr(args, "min_area", None) is not None:
+            value = int(args.min_area)
+            self.min_area_var.set(value)
+            self.app.pieces_calibration.min_area = value
+        if getattr(args, "max_area", None) is not None:
+            value = int(args.max_area)
+            self.max_area_var.set(value)
+            self.app.pieces_calibration.max_area = value
 
     def check_ready(self):
         """Check if ready to proceed."""
@@ -2354,7 +2518,41 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--canny-high", type=int, help="Seuil haut de Canny.")
     parser.add_argument("--min-area", type=int, help="Surface minimale pour la détection de pièces.")
     parser.add_argument("--max-area", type=int, help="Surface maximale pour la détection de pièces.")
-    parser.add_argument("--min-gap", type=int, help="Largeur minimale (px) pour franchir un passage lors de la propagation.")
+    parser.add_argument(
+        "--closing-radius",
+        type=int,
+        help="Rayon du noyau de fermeture (px) appliqué aux contours du trou.",
+    )
+    parser.add_argument(
+        "--disable-closing",
+        action="store_true",
+        help="Désactive la fermeture morphologique sur les contours.",
+    )
+    parser.add_argument(
+        "--opening-radius",
+        type=int,
+        help="Rayon du noyau d'ouverture (px) appliqué aux contours du trou.",
+    )
+    parser.add_argument(
+        "--enable-opening",
+        action="store_true",
+        help="Active l'ouverture morphologique sur les contours.",
+    )
+    parser.add_argument(
+        "--disable-opening",
+        action="store_true",
+        help="Force la désactivation de l'ouverture morphologique.",
+    )
+    parser.add_argument(
+        "--edge-min-area",
+        type=int,
+        help="Surface minimale (px²) pour conserver un contour du trou après nettoyage.",
+    )
+    parser.add_argument(
+        "--min-gap",
+        type=int,
+        help="Alias legacy pour --closing-radius (largeur minimale de passage).",
+    )
     parser.add_argument("--load-session", type=Path, help="Charger un fichier de session JSON existant.")
     parser.add_argument("--save-session", type=Path, help="Enregistrer la session à la fermeture.")
     parser.add_argument(
